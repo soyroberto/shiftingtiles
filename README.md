@@ -9,6 +9,5 @@ http://gomitos.rober.to
 
 ###
 https://calm-bush-07ead6610.4.azurestaticapps.net
-### Fork from:
 
-(http://hermanbanken.github.com/shiftingtiles/)
+![Images]
