@@ -1,4 +1,4 @@
-[Shifting Tiles] Gomitas gomitos.rober.to
+[Shifting Tiles]
 =============
 # My version
 > Running on an azure storage account
