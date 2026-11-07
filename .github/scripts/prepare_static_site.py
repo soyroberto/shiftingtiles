@@ -20,6 +20,7 @@ REQUIRED_FILES = frozenset(
         "jquery-1.8.3.js",
         "less-2.5.1.min.js",
         "shiftingtiles.js",
+        "gallery-source.js",
         "shiftingtiles.less",
     }
 )

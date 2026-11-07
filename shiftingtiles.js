@@ -1,17 +1,26 @@
 (function( $ ){
 
-  $.fn.shiftingtiles = function(images, options) {
-  	
-    // Variables
-    var options = $.extend({
-          photosource: images,
-          duration: 5000,
-        }, options), 
-        timeout, 
-        where = this;
-    
-    where.on("animationend webkitAnimationEnd oAnimationEnd", ".leave > .row", function(){
-      $(this).parent().addClass("left").removeClass("leave");
+	  $.fn.shiftingtiles = function(images, options) {
+
+	    // Variables
+	    images = images.slice();
+	    var options = $.extend({
+	          photosource: images,
+	          duration: 5000,
+	          fallbackPhotos: [],
+	        }, options),
+	        timeout,
+	        where = this;
+	    var fallbackPhotos = options.fallbackPhotos.slice(), fallbackIndex = 0;
+	    where.on("st-photos-update", function(event, nextImages){
+	      if(nextImages && nextImages.length){
+	        images = nextImages.slice();
+	        images.bottom = 0;
+	      }
+	    });
+
+	    where.on("animationend webkitAnimationEnd oAnimationEnd", ".leave > .row", function(){
+	      $(this).parent().addClass("left").removeClass("leave");
     });
     where.on("animationend webkitAnimationEnd oAnimationEnd", ".disappear", function(){
       //console.log("Animation end, removing node",this);
@@ -24,10 +33,13 @@
 
     setup(this);
 
-    // Source
-    function source(){
-      if(typeof images.bottom == "undefined")
-        images.bottom = 0;
+	    // Source
+	    function source(){
+	      if(!images.length){
+	        return fallbackPhotos.length ? fallbackPhotos[fallbackIndex++ % fallbackPhotos.length] : null;
+	      }
+	      if(typeof images.bottom == "undefined")
+	        images.bottom = 0;
 
       var index = images.bottom + Math.floor((images.length - images.bottom) * Math.random());
       //console.log(index, 1, images.bottom, images);
@@ -55,12 +67,43 @@
       timeout = setTimeout(frame, options.duration);
     }
 
-    // Add background image from source to jQuery element
-    function image($element){
-      $element.css("background-image", "url("+source()+")");
-    }
+	    // Add background image from source to jQuery element
+	    function image($element){
+	      var marker = {}, attempts = 0;
+	      $element.data("st-image-request", marker);
+	      function load(url, isFallback){
+	        if(!url || $element.data("st-image-request") !== marker) return;
+	        var pending = new Image(), finished = false;
+	        var deadline = setTimeout(failed, 20000);
+	        function cleanup(){
+	          finished = true;
+	          clearTimeout(deadline);
+	          pending.onload = pending.onerror = null;
+	        }
+	        function failed(){
+	          if(finished) return;
+	          cleanup();
+	          if($element.data("st-image-request") !== marker) return;
+	          if(!isFallback && fallbackPhotos.length){
+	            load(fallbackPhotos[fallbackIndex++ % fallbackPhotos.length], true);
+	          } else if(!isFallback && ++attempts < Math.min(images.length, 3)){
+	            load(source(), false);
+	          }
+	        }
+	        pending.onload = function(){
+	          if(finished) return;
+	          cleanup();
+	          if($element.data("st-image-request") === marker){
+	            $element.css("background-image", "url("+JSON.stringify(url)+")");
+	          }
+	        };
+	        pending.onerror = failed;
+	        pending.src = url;
+	      }
+	      load(source(), false);
+	    }
 
-    // Figure out single or dual and add images
+	    // Figure out single or dual and add images
     function addImage(index, node){
       node = $(node);
       //console.log(node);
@@ -91,18 +134,18 @@
       timeout = setTimeout(frame, options.duration);
   	}
 
-  	$(document.body).keydown(function(e){
-      //console.log("Key up");
-  		if(e.keyCode == 32){ 
-        frame();
-        e.preventDefault();
-        return false;
+    $(document.body).keydown(function(e){
+	      //console.log("Key up");
+      if(e.keyCode == 32){
+	        frame();
+	        e.preventDefault();
+	        return false;
       }
       if(e.keyCode == 38){
         $(".shiftingtiles").toggleClass("leave");
       }
   	});
-    
+
     // Chainability
     return this;
 
@@ -113,10 +156,10 @@ if (!Array.prototype.reduce) {
   Array.prototype.reduce = function reduce(accumulator){
     if (this===null || this===undefined) throw new TypeError("Object is null or undefined");
     var i = 0, l = this.length >> 0, curr;
- 
+
     if(typeof accumulator !== "function") // ES5 : "If IsCallable(callbackfn) is false, throw a TypeError exception."
       throw new TypeError("First argument is not callable");
- 
+
     if(arguments.length < 2) {
       if (l === 0) throw new TypeError("Array length is 0 and no second argument");
       curr = this[0];
@@ -124,12 +167,12 @@ if (!Array.prototype.reduce) {
     }
     else
       curr = arguments[1];
- 
+
     while (i < l) {
       if(i in this) curr = accumulator.call(undefined, curr, this[i], i, this);
       ++i;
     }
- 
+
     return curr;
   };
 }
