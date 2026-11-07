@@ -95,6 +95,28 @@ def test_original_download_has_no_authorization_and_stays_unchanged():
     assert g.session.get.call_args.kwargs["headers"]["Authorization"] == "Bearer secret-token"
 
 
+def test_download_fetches_full_metadata_when_projection_omits_download_url():
+    full = item()
+    projected = dict(full)
+    projected.pop("@microsoft.graph.downloadUrl")
+    session, download = Mock(), Mock()
+
+    def metadata(url, **kwargs):
+        # Reproduce personal OneDrive: a projection has no download URL.
+        return response(projected if "$select=" in url else full)
+
+    session.get.side_effect = metadata
+    download.get.return_value = response()
+    g = GraphClient("secret-token", session=session, download_session=download)
+
+    assert g.download(projected, "jpg") == JPEG
+    assert session.get.call_count == 2  # Before and after version checks remain.
+    assert all(call.args[0] == GRAPH + "/me/drive/items/1"
+               for call in session.get.call_args_list)
+    assert download.get.call_args.kwargs["headers"] == {"Accept-Encoding": "identity"}
+    assert download.get.call_args.kwargs["allow_redirects"] is False
+
+
 @pytest.mark.parametrize("which", ["before", "after"])
 def test_content_tag_race_aborts_publication(which):
     source, changed = item(), item(tag="v2")

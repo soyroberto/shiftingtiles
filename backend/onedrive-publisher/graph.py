@@ -115,7 +115,9 @@ class GraphClient:
             response.close()
 
     def item(self, ident):
-        return self.json(f"{GRAPH}/me/drive/items/{quote(ident, safe='')}?$select={SELECT}")
+        # Personal OneDrive can omit its download URL from projected metadata.
+        # Fetch the full item for download/version checks; keep library scans bounded.
+        return self.json(f"{GRAPH}/me/drive/items/{quote(ident, safe='')}")
 
     def scan(self, library):
         root = self.json(f"{GRAPH}/me/drive/root:/{encoded_path(library.path)}?$select=id,folder,remoteItem")
