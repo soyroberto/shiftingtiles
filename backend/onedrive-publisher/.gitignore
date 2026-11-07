@@ -1,0 +1,16 @@
+local.settings*.json
+!local.settings.example.json
+.env
+.env.*
+!.env.example
+*.token*
+*.cache*
+*msal*.json
+publisher-state*.json
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+.python_packages/

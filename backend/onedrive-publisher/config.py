@@ -1,0 +1,103 @@
+"""Nonsecret configuration; invalid input fails closed before remote operations."""
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+import re
+from urllib.parse import quote
+
+DEFAULT_LIBRARIES = '[{"id":"spotify","path":"Musica/Spotify","recursive":false,"enabled":true}]'
+LIBRARY_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
+MANAGED_PATH = re.compile(r"photos/onedrive/[a-z0-9][a-z0-9_-]{0,47}/[a-f0-9]{64}\.(jpg|jpeg|png|webp|gif|avif)\Z")
+TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+         "webp": "image/webp", "gif": "image/gif", "avif": "image/avif"}
+
+
+class PublisherError(Exception):
+    """Safe error code only: never include Graph URLs, names, tokens or responses."""
+
+
+@dataclass(frozen=True)
+class Library:
+    id: str
+    path: str
+    recursive: bool = False
+    enabled: bool = True
+
+
+def boolean(value, name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise PublisherError("invalid_" + name)
+
+
+def libraries(raw):
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list) or len(data) > 20:
+            raise ValueError
+        result = []
+        seen = set()
+        for row in data:
+            if not isinstance(row, dict) or set(row) - {"id", "path", "recursive", "enabled"}:
+                raise ValueError
+            ident, path = row["id"], row["path"]
+            if not isinstance(ident, str) or not LIBRARY_ID.fullmatch(ident) or ident in seen:
+                raise ValueError
+            if not isinstance(path, str) or len(path) > 1024 or "\\" in path or "\x00" in path:
+                raise ValueError
+            if not path or any(p in ("", ".", "..") for p in path.split("/")):
+                raise ValueError
+            if not isinstance(row.get("recursive", False), bool) or not isinstance(row.get("enabled", True), bool):
+                raise ValueError
+            seen.add(ident)
+            result.append(Library(ident, path, row.get("recursive", False), row.get("enabled", True)))
+        return result
+    except (KeyError, ValueError, TypeError) as exc:
+        raise PublisherError("invalid_ONEDRIVE_LIBRARIES") from None
+
+
+@dataclass(frozen=True)
+class Config:
+    enabled: bool
+    libraries: list
+    client_id: str
+    account_url: str = "https://saauxfotos.blob.core.windows.net"
+    state_container: str = "onedrive-state"
+
+    @classmethod
+    def from_env(cls):
+        client = os.getenv("ONEDRIVE_CLIENT_ID", "")
+        if client and not re.fullmatch(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}", client):
+            raise PublisherError("invalid_ONEDRIVE_CLIENT_ID")
+        # Deliberately fixed storage boundaries for this single-site beta.
+        return cls(boolean(os.getenv("ONEDRIVE_SYNC_ENABLED", "false"), "ONEDRIVE_SYNC_ENABLED"),
+                   libraries(os.getenv("ONEDRIVE_LIBRARIES", DEFAULT_LIBRARIES)), client)
+
+
+def encoded_path(path):
+    return "/".join(quote(segment, safe="") for segment in path.split("/"))
+
+
+def content_version(item):
+    if not item.get("id") or not (item.get("cTag") or item.get("eTag")):
+        raise PublisherError("missing_item_version")
+    return json.dumps([item.get("cTag"), item.get("eTag")], separators=(",", ":"))
+
+
+def photo_path(library_id, item_id, version, ext):
+    if not LIBRARY_ID.fullmatch(library_id) or ext not in TYPES:
+        raise PublisherError("unsafe_photo_path")
+    digest = hashlib.sha256(json.dumps([library_id, item_id, version], separators=(",", ":")).encode()).hexdigest()
+    return f"photos/onedrive/{library_id}/{digest}.{ext}"
+
+
+def manifest(libs):
+    from datetime import datetime, timezone
+    paths = sorted({item["path"] for lib in libs.values() for item in lib["items"].values()})
+    if any(not MANAGED_PATH.fullmatch(path) for path in paths):
+        raise PublisherError("unsafe_manifest_path")
+    return {"version": 1, "images": paths,
+            "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}

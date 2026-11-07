@@ -1,0 +1,17 @@
+{
+  "version": "2.0",
+  "functionTimeout": "00:04:00",
+  "logging": {
+    "logLevel": {
+      "default": "Warning",
+      "Function.OneDrivePublisher.User": "Information",
+      "azure": "Critical",
+      "msal": "Critical",
+      "urllib3": "Critical"
+    }
+  },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  }
+}

@@ -1,0 +1,13 @@
+.git*
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+tests/
+local.settings*.json
+.env*
+*.cache*
+*.token*
+*msal*.json
+publisher-state*.json
+requirements-dev.txt

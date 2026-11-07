@@ -2,3 +2,17 @@
 .DS_Store
 .DS_Store
 .DS_Store
+
+# Local task tooling and reports are not application deployment files.
+.work/
+outputs/
+.manus/
+
+# Never commit local runtime credentials or token-cache files.
+local.settings*.json
+!local.settings.example.json
+.env
+.venv/
+__pycache__/
+*.pyc
+msal-cache.json
