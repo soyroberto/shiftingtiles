@@ -139,7 +139,8 @@ def test_hourly_starts_both_then_continuation_rotates_without_starting_idle_libr
     assert len(calls)==2 and base.controls[COORDINATOR]['pending_starts']==[]
 
 
-def test_new_library_is_not_starved_by_existing_long_spotify_job():
+@pytest.mark.parametrize('start_new',[True,False])
+def test_new_library_is_not_starved_by_existing_long_spotify_job(start_new):
     base=Shared();memory=BatchMemory();clock=Clock();clock.value=0
     monkey=pytest.MonkeyPatch();monkey.setattr(resumable,'silent_token',lambda *_:'token')
     try:
@@ -148,7 +149,7 @@ def test_new_library_is_not_starved_by_existing_long_spotify_job():
     finally:monkey.undo()
     base.controls['publisher-work.json']=copy.deepcopy(memory.control)
     seen=[]
-    run_libraries(base,cfg(),engine=lambda view,*_,**kw:seen.append(view.library_id) or {'status':'ok'},clock=lambda:0)
+    run_libraries(base,cfg(),start_new=start_new,engine=lambda view,*_,**kw:seen.append(view.library_id) or {'status':'ok'},clock=lambda:0)
     assert seen==['instagram']
     run_libraries(base,cfg(),start_new=False,engine=lambda view,*_,**kw:seen.append(view.library_id) or {'status':'deferred'},clock=lambda:0)
     assert seen==['instagram','spotify']

@@ -127,15 +127,22 @@ class LibraryStore:
 
 def _coordinator(value):
     if value is None:
-        return {"version": 1, "last_library": None, "pending_starts": []}
-    if (not isinstance(value, dict) or set(value) != {"version", "last_library", "pending_starts"}
+        return {"version": 1, "last_library": None, "pending_starts": [], "known_libraries": []}
+    fields = {"version", "last_library", "pending_starts"}
+    if (not isinstance(value, dict) or set(value) not in (fields, fields | {"known_libraries"})
             or type(value["version"]) is not int or value["version"] != 1):
         raise PublisherError("invalid_coordinator")
+    value.setdefault("known_libraries", [])  # Migrate the first coordinator without resetting jobs.
     last, pending = value["last_library"], value["pending_starts"]
     if (last is not None and (not isinstance(last, str) or not LIBRARY_ID.fullmatch(last)) or
             not isinstance(pending, list) or len(pending) > 20 or
             any(not isinstance(ident, str) or not LIBRARY_ID.fullmatch(ident) for ident in pending) or
             len(pending) != len(set(pending))):
+        raise PublisherError("invalid_coordinator")
+    known = value["known_libraries"]
+    if (not isinstance(known, list) or len(known) > 20 or
+            any(not isinstance(ident, str) or not LIBRARY_ID.fullmatch(ident) for ident in known) or
+            len(known) != len(set(known))):
         raise PublisherError("invalid_coordinator")
     return value
 
@@ -153,9 +160,17 @@ def run_libraries(store, config, start_new=True, deadline=None, engine=run_resum
     coordinator = _coordinator(store.load_control(name=COORDINATOR))
     active = {lib.id for lib in libraries}
     coordinator["pending_starts"] = [ident for ident in coordinator["pending_starts"] if ident in active]
-    if start_new:
+    known = set(coordinator["known_libraries"]) & active
+    new_ids = [lib.id for lib in libraries if lib.id not in known]
+    if start_new or new_ids:
+        # A continuation may win the primary lease before the hourly timer.
+        # New libraries must still be registered, not wait behind a long job.
         coordinator["pending_starts"] = list(dict.fromkeys(coordinator["pending_starts"] +
-                                                         [lib.id for lib in libraries]))
+                                                         ([lib.id for lib in libraries] if start_new else new_ids)))
+        coordinator["known_libraries"] = [lib.id for lib in libraries]
+        store.save_control(coordinator, name=COORDINATOR)
+    elif set(coordinator["known_libraries"]) != known:
+        coordinator["known_libraries"] = [lib.id for lib in libraries]
         store.save_control(coordinator, name=COORDINATOR)
     ready, uninitialized = {}, []
     for lib in libraries:
