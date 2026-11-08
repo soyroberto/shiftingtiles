@@ -5,16 +5,16 @@ const path = require('node:path');
 const vm = require('node:vm');
 const api = require('../gallery-source.js');
 const photo = 'photos/onedrive/spotify/' + 'a'.repeat(64) + '.jpg';
-const photo2 = 'photos/onedrive/second/' + 'b'.repeat(64) + '.png';
+const photo2 = 'photos/onedrive/spotify/' + 'b'.repeat(64) + '.png';
+const cacheKey = 'shiftingtiles-public-gallery-v1:photos/onedrive/spotify/gallery.json';
 const manifest = images => ({version: 1, images, updatedAt: '2026-11-06T08:00:00Z'});
 
 function fixture(cached, storageThrows = false) {
   let success, failure, nextTimer = 0;
   const updates = [], timers = new Map(), data = {};
-  if (cached) data.cache = JSON.stringify(cached);
+  if (cached) data[cacheKey] = JSON.stringify(cached);
   const controller = api.createController({
     fallback: ['f1.jpeg', 'f2.jpeg', 'f1.jpeg'],
-    cacheKey: 'cache',
     storage: {
       getItem: key => { if (storageThrows) throw Error('blocked'); return data[key] || null; },
       setItem: (key, value) => { if (storageThrows) throw Error('blocked'); data[key] = value; }
@@ -55,11 +55,11 @@ test('startup plays bundled fallback immediately, then prefers OneDrive', () => 
 
 test('HTTP 304 retains photos and cache without reinitializing playback', () => {
   const f = fixture(); f.controller.start(); f.success(manifest([photo]));
-  const cache = f.data.cache;
+  const cache = f.data[cacheKey];
   f.controller.refresh(); f.success(undefined, true);
   assert.deepEqual(f.controller.current(), {images: [photo], source: 'onedrive'});
   assert.equal(f.updates.length, 2);
-  assert.equal(f.data.cache, cache);
+  assert.equal(f.data[cacheKey], cache);
   assert.equal(f.timers.size, 1);
   assert.equal([...f.timers.values()][0].ms, 60000);
 });
@@ -79,14 +79,14 @@ test('valid empty source clears stale cache and selects bundled fallback', () =>
   assert.equal(f.controller.current().source, 'cached-onedrive');
   f.success(manifest([]));
   assert.deepEqual(f.controller.current().images, ['f1.jpeg', 'f2.jpeg']);
-  assert.deepEqual(JSON.parse(f.data.cache).images, []);
+  assert.deepEqual(JSON.parse(f.data[cacheKey]).images, []);
 });
 
 test('invalid manifest retains cached photos and does not poison the cache', () => {
   const f = fixture(manifest([photo])); f.controller.start();
   f.success({version: 1, images: ['../credentials.json']});
   assert.deepEqual(f.controller.current().images, [photo]);
-  assert.deepEqual(JSON.parse(f.data.cache).images, [photo]);
+  assert.deepEqual(JSON.parse(f.data[cacheKey]).images, [photo]);
 });
 
 test('blocked browser storage and unavailable manifest still allow bundled gallery', () => {

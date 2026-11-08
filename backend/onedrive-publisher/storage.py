@@ -34,6 +34,22 @@ def validate_state(state):
         if not pending_cleanup.issubset(managed):
             raise ValueError
         collections = [state["libraries"]]
+        # Runtime library views journal separate publications without replacing
+        # another library's transaction or its committed gallery.
+        transactions = state.get("library_transactions", {})
+        if not isinstance(transactions, dict) or len(transactions) > 20:
+            raise ValueError
+        from config import LIBRARY_ID, manifest
+        for ident, tx in transactions.items():
+            if (not LIBRARY_ID.fullmatch(ident) or not isinstance(tx, dict) or
+                    set(tx) != {"libraries", "manifest"} or set(tx["libraries"]) != {ident}):
+                raise ValueError
+            m = tx["manifest"]
+            if (set(m) != {"version", "images", "updatedAt"} or type(m["version"]) is not int or
+                    m["version"] != 1 or not isinstance(m["updatedAt"], str) or
+                    m["images"] != manifest(tx["libraries"])["images"]):
+                raise ValueError
+            collections.append(tx["libraries"])
         if state["transaction"] is not None:
             collections.append(state["transaction"]["libraries"])
             m = state["transaction"]["manifest"]

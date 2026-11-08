@@ -18,35 +18,64 @@
     return result;
   }
 
-  function manifestImages(manifest) {
-    if (!manifest || manifest.version !== 1 || !Array.isArray(manifest.images)) {
+  function checkedLibrary(value) {
+    return typeof value === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$(?![\s\S])/.test(value) ? value : null;
+  }
+
+  function libraryFromSearch(search) {
+    var parts = String(search || "").replace(/^\?/, "").split("&");
+    var found = false, library = "spotify";
+    for (var i = 0; i < parts.length; i++) {
+      var pair = parts[i].split("="), name;
+      try { name = decodeURIComponent(pair.shift().replace(/\+/g, " ")); }
+      catch (error) { return null; }
+      if (name !== "library") continue;
+      // An explicit invalid or ambiguous selection must never become Spotify.
+      if (found) return null;
+      found = true;
+      try { library = checkedLibrary(decodeURIComponent(pair.join("=").replace(/\+/g, " "))); }
+      catch (error) { return null; }
+    }
+    return library;
+  }
+
+  function manifestUrlFor(library) {
+    library = checkedLibrary(library);
+    return library === null ? null : "photos/onedrive/" + library + "/gallery.json";
+  }
+
+  function manifestImages(manifest, library) {
+    library = arguments.length < 2 ? "spotify" : checkedLibrary(library);
+    if (library === null || !manifest || manifest.version !== 1 || !Array.isArray(manifest.images)) {
       throw new Error("Unsupported gallery manifest");
     }
-    // Only opaque, same-origin files published by the connector may be displayed.
-    var pattern = /^photos\/onedrive\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+\.(?:jpe?g|png|webp|gif|avif)$/i;
+    // Every path, including cached paths, must belong to this exact library.
+    var prefix = "photos/onedrive/" + library + "/";
+    var filename = /^[A-Za-z0-9_-]+\.(?:jpe?g|png|webp|gif|avif)$(?![\s\S])/i;
     for (var i = 0; i < manifest.images.length; i++) {
-      if (typeof manifest.images[i] !== "string" || !pattern.test(manifest.images[i])) {
-        throw new Error("Unsafe photo path in gallery manifest");
+      var image = manifest.images[i];
+      if (typeof image !== "string" || image.indexOf(prefix) !== 0 || !filename.test(image.slice(prefix.length))) {
+        throw new Error("Unsafe or foreign photo path in gallery manifest");
       }
     }
     return uniqueStrings(manifest.images);
   }
 
   function createController(options) {
-    var fallback = uniqueStrings(options.fallback || []);
-    if (!fallback.length) throw new Error("Bundled fallback photos are required");
+    var library = Object.prototype.hasOwnProperty.call(options, "libraryId") ? checkedLibrary(options.libraryId) : "spotify";
+    var fallback = library === "spotify" ? uniqueStrings(options.fallback || []) : [];
     var schedule = options.schedule || function (callback, delay) { return setTimeout(callback, delay); };
     var cancel = options.cancel || function (timer) { clearTimeout(timer); };
     var refreshMs = options.refreshMs || 60000;
     var storage = options.storage;
-    var cacheKey = options.cacheKey || "shiftingtiles-public-gallery-v1";
-    var running = false, inFlight = false, timer = null, signature = null;
-    var current = [], source = "bundled";
+    var cacheKey = "shiftingtiles-public-gallery-v1:" + manifestUrlFor(library);
+    var running = false, activeRequest = null, timer = null, signature = null;
+    var current = [], source = "empty";
 
     function apply(images, nextSource) {
       var next = images.length ? images : fallback;
       var key = JSON.stringify(next);
-      source = nextSource;
+      source = next.length ? nextSource : "empty";
       current = next.slice();
       if (key !== signature) {
         signature = key;
@@ -55,9 +84,10 @@
     }
 
     function readCache() {
+      if (library === null) return [];
       try {
         var cached = storage && storage.getItem(cacheKey);
-        return cached ? manifestImages(JSON.parse(cached)) : [];
+        return cached ? manifestImages(JSON.parse(cached), library) : [];
       } catch (error) { return []; }
     }
 
@@ -66,37 +96,40 @@
       catch (error) { /* Storage restrictions must never prevent gallery playback. */ }
     }
 
-    function finish() {
-      inFlight = false;
+    function finish(request) {
+      if (activeRequest !== request) return;
+      activeRequest = null;
       if (running) timer = schedule(refresh, refreshMs);
     }
 
     function refresh() {
-      if (!running || inFlight) return;
+      if (!running || activeRequest !== null || library === null) return;
       if (timer !== null) { cancel(timer); timer = null; }
-      inFlight = true;
+      var request = {};
+      activeRequest = request;
       function failure(error) {
-        if (!inFlight) return;
+        if (activeRequest !== request) return;
         if (running && options.onError) options.onError(error);
-        // Keep the current source on transient errors: never erase last good photos.
-        finish();
+        // Keep only this library's last good photos on transient errors.
+        finish(request);
       }
       try {
         options.request(function (manifest, notModified) {
-          if (!inFlight) return;
-          if (!running) { finish(); return; }
-          if (notModified === true) { finish(); return; }
+          if (activeRequest !== request) return;
+          if (!running) { finish(request); return; }
+          if (notModified === true) { finish(request); return; }
           var images;
-          try { images = manifestImages(manifest); }
+          try { images = manifestImages(manifest, library); }
           catch (error) { failure(error); return; }
           writeCache(manifest);
           apply(images, images.length ? "onedrive" : "bundled");
-          finish();
+          finish(request);
         }, failure);
       } catch (error) { failure(error); }
     }
 
     return {
+      libraryId: library,
       start: function () {
         if (running) return;
         running = true;
@@ -107,6 +140,7 @@
       refresh: refresh,
       stop: function () {
         running = false;
+        activeRequest = null;
         if (timer !== null) cancel(timer);
         timer = null;
       },
@@ -117,17 +151,26 @@
   function mount($gallery, fallback, config) {
     config = config || {};
     var $ = window.jQuery;
+    var library = Object.prototype.hasOwnProperty.call(config, "libraryId") ? checkedLibrary(config.libraryId) : libraryFromSearch(window.location.search);
+    var existing = $gallery.data("shiftingtiles-source");
+    if (existing) {
+      if (existing.libraryId !== library) throw new Error("Library changes require a new page");
+      return existing;
+    }
+    var manifestUrl = manifestUrlFor(library);
+    // The bundled collection (including per-image retries) is Spotify-only.
+    fallback = library === "spotify" ? uniqueStrings(fallback || []) : [];
     var storage;
     try { storage = window.localStorage; } catch (error) { storage = null; }
     var initialized = false;
     var controller = createController({
+      libraryId: library,
       fallback: fallback,
       storage: storage,
-      cacheKey: "shiftingtiles-public-gallery-v1:" + (config.manifestUrl || "gallery.json"),
       refreshMs: config.refreshMs || 60000,
       request: function (success, failure) {
         $.ajax({
-          url: config.manifestUrl || "gallery.json",
+          url: manifestUrl,
           dataType: "json",
           cache: false,
           ifModified: true,
@@ -138,6 +181,19 @@
       },
       onImages: function (images, source) {
         $gallery.attr("data-photo-source", source);
+        $gallery.attr("data-photo-library", library === null ? "" : library);
+        $gallery.css("visibility", images.length ? "" : "hidden");
+        if (!images.length) {
+          if (initialized) {
+            // The legacy plugin ignores []; a null source makes its next frame inert.
+            // Invalidate pending image callbacks and erase previously visible photos.
+            $gallery.trigger("st-photos-update", [[null]]);
+            $gallery.find(".single, .dual > div").each(function () {
+              $(this).data("st-image-request", {}).css("background-image", "none");
+            });
+          }
+          return; // Never create animation timers before the first real image.
+        }
         if (!initialized) {
           initialized = true;
           $gallery.shiftingtiles(images.slice(), { fallbackPhotos: fallback.slice() });
@@ -152,5 +208,12 @@
     return controller;
   }
 
-  return { uniqueStrings: uniqueStrings, manifestImages: manifestImages, createController: createController, mount: mount };
+  return {
+    uniqueStrings: uniqueStrings,
+    libraryFromSearch: libraryFromSearch,
+    manifestUrlFor: manifestUrlFor,
+    manifestImages: manifestImages,
+    createController: createController,
+    mount: mount
+  };
 }));

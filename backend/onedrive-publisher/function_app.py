@@ -6,7 +6,7 @@ import azure.functions as func
 from azure.core.exceptions import HttpResponseError
 from config import Config
 from batch_storage import BatchStore
-from resumable import run_resumable
+from library_sync import run_libraries as run_resumable
 
 app = func.FunctionApp()
 # Preserve the existing test/admin factory seam; runtime uses the extended store.
@@ -28,8 +28,8 @@ def _run(start_new):
         with store.locked():
             result = run_resumable(store, config, start_new=start_new,
                                    deadline=started + config.run_seconds)
-        logging.info("OneDrive resumable: status=%s phase=%s scanned=%s copied=%s images=%s omitted=%s pending_cleanup=%s elapsed=%.2f",
-                     result.get("status", "unknown"), result.get("phase", "idle"),
+        logging.info("OneDrive resumable: library=%s status=%s phase=%s scanned=%s copied=%s images=%s omitted=%s pending_cleanup=%s elapsed=%.2f",
+                     result.get("library", "none"), result.get("status", "unknown"), result.get("phase", "idle"),
                      result.get("scanned", 0), result.get("copied", 0),
                      result.get("images", 0), result.get("omitted", 0), result.get("pending_cleanup", 0),
                      time.monotonic() - started)

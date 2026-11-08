@@ -24,6 +24,12 @@ _DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 _CHUNK = re.compile(r"jobs/[a-f0-9]{32}/(?:scan|copy|intent|snapshot)/[0-9]{6}\.json\Z")
 _KINDS = frozenset(("scan", "copy", "intent", "snapshot"))
 
+def _control_name(name):
+    if (not isinstance(name, str) or not re.fullmatch(
+            r"publisher-(?:work|coordinator)\.json|libraries/[a-z0-9][a-z0-9_-]{0,47}/publisher-work\.json", name)):
+        raise PublisherError("unsafe_control_name")
+    return name
+
 
 def _field(value, key, default=None):
     """Azure properties are mapping-like; allow attribute-backed SDK properties too."""
@@ -82,10 +88,11 @@ class BatchStore(BlobStore):
             raise PublisherError(code)
         return raw
 
-    def load_control(self):
+    def load_control(self, name=CONTROL_BLOB):
+        name = _control_name(name)
         self.guard()
         try:
-            raw = self._read_bounded(self.private.get_blob_client(CONTROL_BLOB),
+            raw = self._read_bounded(self.private.get_blob_client(name),
                                      MAX_CONTROL_BYTES, "invalid_work_control")
         except ResourceNotFoundError:
             self._check_lease()
@@ -96,12 +103,13 @@ class BatchStore(BlobStore):
         self._check_lease()
         return value
 
-    def save_control(self, data):
+    def save_control(self, data, name=CONTROL_BLOB):
+        name = _control_name(name)
         if not isinstance(data, dict):
             raise PublisherError("invalid_work_control")
         raw = _json_bytes(data, MAX_CONTROL_BYTES, "invalid_work_control")
         self.guard()
-        blob = self.private.get_blob_client(CONTROL_BLOB)
+        blob = self.private.get_blob_client(name)
         settings = ContentSettings(content_type="application/json")
         try:
             props = blob.get_blob_properties()
@@ -239,7 +247,15 @@ class BatchStore(BlobStore):
                 raise PublisherError("foreign_copy_collision")
         self.guard()
 
-    def publish(self, data):
+    def publish(self, data, name="gallery.json"):
+        if name != "gallery.json":
+            if not isinstance(name, str) or not re.fullmatch(
+                    r"photos/onedrive/[a-z0-9][a-z0-9_-]{0,47}/gallery\.json", name):
+                raise PublisherError("unsafe_manifest_name")
+            prefix = name.rsplit("/", 1)[0] + "/"
+            if not isinstance(data, dict) or not isinstance(data.get("images"), list) or any(
+                    not isinstance(path, str) or not path.startswith(prefix) for path in data["images"]):
+                raise PublisherError("cross_library_manifest")
         if (not isinstance(data, dict) or set(data) != {"version", "images", "updatedAt"}
                 or type(data["version"]) is not int or data["version"] != 1
                 or not isinstance(data["images"], list) or not isinstance(data["updatedAt"], str)):
@@ -252,7 +268,7 @@ class BatchStore(BlobStore):
             raise PublisherError("invalid_manifest") from None
         settings = ContentSettings(content_type="application/json", cache_control="no-store")
         self.guard()
-        blob = self.public.get_blob_client("gallery.json")
+        blob = self.public.get_blob_client(name)
         try:
             # Creation publishes the final manifest directly, never an empty placeholder.
             blob.upload_blob(raw, overwrite=False, content_settings=settings)

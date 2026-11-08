@@ -395,7 +395,7 @@ def test_bounds_never_publish_or_copy_partial_scan(batch, cfg, pages):
 
 
 @pytest.mark.parametrize("cfg", [config(libraries=[]), config(libraries=[Library("a", "A"), Library("b", "B")]),
-    config(libraries=[Library("a", "A", recursive=True)]), config(batch_size=101),
+    config(batch_size=101),
     config(max_items=100001), config(max_pages=501), config(run_seconds=181)])
 def test_invalid_configuration_fails_closed_before_primary_or_graph(batch, cfg):
     assert run(batch, cfg=cfg)["status"] == "failed"

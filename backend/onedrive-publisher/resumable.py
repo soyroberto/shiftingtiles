@@ -6,6 +6,7 @@ are ephemeral. Chunk slots are random create-only addresses, not progress indexe
 a put-before-checkpoint crash must never alias the next (possibly changed) page.
 """
 import copy
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -34,7 +35,7 @@ _FATAL = {"duplicate_item_during_scan", "pagination_bound", "item_bound", "page_
           "invalid_graph_root", "invalid_graph_id", "source_not_owned_folder",
           "download_race_before", "download_race_after", "download_item_changed",
           "download_item_outside_root", "invalid_raster_signature", "file_size_bound",
-          "missing_item_version", "invalid_item_version"}
+          "missing_item_version", "invalid_item_version", "source_ancestry_changed", "folder_bound"}
 _DEFER = {"engine_deadline", "scan_deadline", "retry_budget"}
 # Reserve bounded writes/checkpoints inside the integral 180s invocation budget.
 _CHECKPOINT_RESERVE = 10
@@ -68,16 +69,23 @@ def _skipped(value, code="invalid_work_control"):
 
 def validate_control(control):
     """Strict schema, bounded catalogs and root/cursor validation before Graph IO."""
-    _require(isinstance(control, dict) and set(control) == _CONTROL)
+    _require(isinstance(control, dict) and set(control) in (_CONTROL, _CONTROL | {"recursive_upgrade"}))
     _require(type(control["version"]) is int and control["version"] == 1)
     _require(isinstance(control["config_fingerprint"], str) and
              _HEX.fullmatch(control["config_fingerprint"]))
     _require(isinstance(control["owner"], str) and 0 < len(control["owner"]) <= 1024)
+    if "recursive_upgrade" in control:
+        upgrade = control["recursive_upgrade"]
+        _require(isinstance(upgrade, dict) and set(upgrade) == {"from", "root"} and
+                 isinstance(upgrade["from"], str) and _HEX.fullmatch(upgrade["from"]))
+        PagedGraph._checked_root(upgrade["root"])
     if control["retained"] is not None:
         _ref(control["retained"], kind="snapshot")
     metrics = control["completed"]
     fields = {"runs", "images", "ownership_refs"}
-    _require(isinstance(metrics, dict) and set(metrics) in (fields, fields | {"invalid_ref"}))
+    _require(isinstance(metrics, dict) and fields <= set(metrics) <= fields | {"invalid_ref", "root"})
+    if "root" in metrics:
+        PagedGraph._checked_root(metrics["root"])
     if metrics.get("invalid_ref") is not None:
         _ref(metrics["invalid_ref"], kind="snapshot")
     _integer(metrics["runs"], 2 ** 53)
@@ -197,7 +205,7 @@ def _expand(store, refs, kind, job_id, check, depth=0, visited=None):
             yield payload
 
 
-def _page(page, root):
+def _page(page, root, recursive=None):
     _require(isinstance(page, dict) and set(page) == {"rows", "ids", "next", "entries", "skipped"},
              "incomplete_page")
     _require(isinstance(page["rows"], list) and isinstance(page["ids"], list), "incomplete_page")
@@ -210,8 +218,12 @@ def _page(page, root):
         ids.add(ident)
     rows = set()
     for row in page["rows"]:
-        _require(isinstance(row, dict) and set(row) == {"id", "size", "cTag", "eTag", "file", "ext"},
+        fields = {"id", "size", "cTag", "eTag", "file", "ext"}
+        _require(isinstance(row, dict) and set(row) in (fields, fields | {"parent_id"}),
                  "invalid_graph_item")
+        _require(recursive is None or ("parent_id" in row) == recursive, "invalid_graph_item")
+        if "parent_id" in row:
+            PagedGraph._identifier(row["parent_id"])
         _require(row["id"] in ids and row["id"] not in rows, "duplicate_item_during_scan")
         rows.add(row["id"])
         _require(row["ext"] in TYPES and isinstance(row["file"], dict) and
@@ -223,16 +235,18 @@ def _page(page, root):
                      for tag in (row["cTag"], row["eTag"])), "invalid_item_version")
         content_version(row)
     if page["next"] is not None:
+        _require(isinstance(page["next"], str), "unsafe_graph_cursor")
+        _require(recursive is None or page["next"].startswith("tree:") == recursive, "unsafe_graph_cursor")
         PagedGraph._cursor_checked(root, page["next"])
     _skipped(page["skipped"], "invalid_graph_item")
     _require(sum(page["skipped"].values()) + len(rows) == len(ids), "incomplete_page")
     return page
 
 
-def _load_pages(store, job, check):
+def _load_pages(store, job, check, recursive=None):
     pages, ids, cursors, skipped = [], set(), set(), {}
     for page in _expand(store, job["scan_refs"], "scan", job["id"], check):
-        _page(page, job["root"])
+        _page(page, job["root"], recursive)
         _require(not ids.intersection(page["ids"]), "duplicate_item_during_scan")
         ids.update(page["ids"])
         if pages:
@@ -307,6 +321,8 @@ def _batch_payload(payload, pages, library_id, allow_skips=False):
     rows, end = _slice(pages, payload["start"], len(records))
     _require(end == payload["end"] and len(rows) == len(records), "invalid_private_ledger")
     for row, rec in zip(rows, records):
+        if "parent_id" in row:
+            PagedGraph._identifier(row["parent_id"])
         expected = _record(row, library_id, rec["sha256"])
         if "skip" in rec:
             _require(allow_skips, "invalid_private_ledger")
@@ -341,11 +357,11 @@ def _limits(config):
              type(pages) is int and 1 <= pages <= 500 and type(seconds) in (int, float) and
              math.isfinite(seconds) and 15 <= seconds <= 180, "invalid_resumable_config")
     libs = [lib for lib in config.libraries if lib.enabled]
-    _require(len(libs) == 1 and libs[0].recursive is False, "invalid_resumable_config")
+    _require(len(libs) == 1 and type(libs[0].recursive) is bool, "invalid_resumable_config")
     return libs[0], batch, items, pages, seconds
 
 
-def _archive(store, control, lib_id):
+def _archive(store, control, lib_id, save=True):
     job = control["job"]
     if job and (job["copy_refs"] or job["intent_ref"]):
         refs = control["completed"]["ownership_refs"]
@@ -366,10 +382,39 @@ def _archive(store, control, lib_id):
             "library_id": lib_id, "root": job["root"], "job_id": job["id"],
             "copy_refs": job["copy_refs"], "intent_ref": job["intent_ref"]}))
     control["job"] = None
-    _save(store, control)
+    if save:
+        _save(store, control)
 
 
-def _archived_proof(store, control, lib, root, check):
+def _upgrade_root(store, control, lib, check):
+    """The old durable scope must prove the SAME resolved root before widening.
+
+    Completed legacy controls without any root proof cannot be safely migrated.
+    A successful new run saves its root; an active legacy job already has it.
+    """
+    if control["job"] is not None:
+        return control["job"]["root"]
+    if "root" in control["completed"]:
+        return control["completed"]["root"]
+    refs = control["completed"]["ownership_refs"][:]
+    if control["completed"].get("invalid_ref") is not None:
+        refs.append(control["completed"]["invalid_ref"])
+    roots = []
+    for ref in refs:
+        check()
+        value = store.read_chunk(ref)
+        fields = {"owner", "config_fingerprint", "library_id", "root", "job_id", "copy_refs"}
+        _require(isinstance(value, dict) and set(value) in (fields, fields | {"intent_ref"}),
+                 "invalid_private_ledger")
+        _require(_ref(ref)[0] == value["job_id"], "invalid_private_ledger")
+        PagedGraph._checked_root(value["root"])
+        if (value["owner"] == control["owner"] and value["library_id"] == lib.id and
+                value["config_fingerprint"] == control["config_fingerprint"]):
+            roots.append(value["root"])
+    return roots[0] if roots and all(root == roots[0] for root in roots) else None
+
+
+def _archived_proof(store, control, lib, root, check, old_fingerprint=None, rejected=None):
     proof = {}
     for ref in control["completed"]["ownership_refs"]:
         check()
@@ -378,7 +423,8 @@ def _archived_proof(store, control, lib, root, check):
         _require(isinstance(archive, dict) and set(archive) == fields, "invalid_private_ledger")
         _require(_ref(ref)[0] == archive["job_id"], "invalid_private_ledger")
         PagedGraph._checked_root(archive["root"])
-        if (archive["owner"] != control["owner"] or archive["config_fingerprint"] != control["config_fingerprint"] or
+        if (archive["owner"] != control["owner"] or
+                archive["config_fingerprint"] not in (control["config_fingerprint"], old_fingerprint) or
                 archive["library_id"] != lib.id or archive["root"] != root):
             continue  # Old-account/config/root ledgers preserve ownership but never authorize adoption.
         _require(isinstance(archive["copy_refs"], list) and len(archive["copy_refs"]) <= 128, "invalid_private_ledger")
@@ -390,6 +436,8 @@ def _archived_proof(store, control, lib, root, check):
             _require(isinstance(payload, dict) and set(payload) == {"start", "end", "records"}, "invalid_private_ledger")
             for rec in _records(payload["records"], lib.id):
                 if "skip" in rec:
+                    if rejected is not None and archive["config_fingerprint"] == old_fingerprint:
+                        rejected[(rec["id"], rec["version"])] = rec
                     continue  # A rejected source is never ownership/upload proof.
                 previous = proof.get(rec["path"])
                 if previous is None or rec["sha256"] is not None:
@@ -397,7 +445,7 @@ def _archived_proof(store, control, lib, root, check):
     return proof
 
 
-def _previous_invalid(store, control, lib, root, check):
+def _previous_invalid(store, control, lib, root, check, old_fingerprint=None):
     """Only the last complete, same-owner/root scan authorizes a cached rejection."""
     ref = control["completed"].get("invalid_ref")
     if ref is None:
@@ -407,7 +455,8 @@ def _previous_invalid(store, control, lib, root, check):
     _require(isinstance(value, dict) and set(value) == fields, "invalid_private_ledger")
     _require(_ref(ref)[0] == value["job_id"], "invalid_private_ledger")
     PagedGraph._checked_root(value["root"])
-    if (value["owner"] != control["owner"] or value["config_fingerprint"] != control["config_fingerprint"] or
+    if (value["owner"] != control["owner"] or
+            value["config_fingerprint"] not in (control["config_fingerprint"], old_fingerprint) or
             value["library_id"] != lib.id or value["root"] != root):
         return {}
     _require(isinstance(value["copy_refs"], list) and len(value["copy_refs"]) <= 128, "invalid_private_ledger")
@@ -456,7 +505,7 @@ def _target(state, retained, lib, job, records, partial=False):
         if previous and previous["path"] != rec["path"]:
             items["previous:" + hashlib.sha256(previous["path"].encode()).hexdigest()] = previous
         items[rec["id"]] = {"path": rec["path"], "version": rec["version"]}
-    target[lib.id] = {"items": items, "source_path": lib.path, "recursive": False, "skipped": skipped}
+    target[lib.id] = {"items": items, "source_path": lib.path, "recursive": lib.recursive, "skipped": skipped}
     for ident, original in retained.items():
         dest = target.setdefault(ident, {"items": {}})["items"]
         paths = {item["path"] for item in dest.values()}
@@ -556,13 +605,20 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
         if not state["connected"]:
             return {"status": "disconnected"}
         fingerprint = _fingerprint(config, lib, state["owner"])
+        old_fingerprint = _fingerprint(config, replace(lib, recursive=False), state["owner"])
+        widening = (control is not None and lib.recursive is True and
+                    control["owner"] == state["owner"] and
+                    control["config_fingerprint"] == old_fingerprint and
+                    state["transaction"] is None and
+                    not (control["job"] and control["job"].get("publication") is not None))
         if control is not None and (control["config_fingerprint"] != fingerprint or control["owner"] != state["owner"]):
             # Keep bootstrap/old-account proof intact; require deliberate private recovery
             # instead of silently resetting its ownership boundary.
-            if not (state["transaction"] is not None or
-                    (control["job"] and control["job"].get("publication") is not None)):
-                _archive(store, control, lib.id)
-            return {"status": "aborted", "reason": "ownership_or_config_changed"}
+            if not widening:
+                if not (state["transaction"] is not None or
+                        (control["job"] and control["job"].get("publication") is not None)):
+                    _archive(store, control, lib.id)
+                return {"status": "aborted", "reason": "ownership_or_config_changed"}
         if control is None:
             control = {"version": 1, "config_fingerprint": fingerprint, "owner": state["owner"],
                        "retained": None, "job": None,
@@ -586,6 +642,21 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
         root = graph.root(lib)
         PagedGraph._checked_root(root)
         check()
+        if widening:
+            previous_root = _upgrade_root(store, control, lib, check)
+            if previous_root != root:
+                return {"status": "aborted", "reason": "source_root_changed"}
+            # One atomic checkpoint: old immutable SHA/intent proof, retained ref
+            # and counters survive; cursor MUST restart to discover descendants.
+            _archive(store, control, lib.id, save=False)
+            control["recursive_upgrade"] = {"from": old_fingerprint, "root": root}
+            control["config_fingerprint"] = fingerprint
+            _save(store, control)
+        upgrade = control.get("recursive_upgrade")
+        if upgrade is not None:
+            _require(lib.recursive is True and upgrade["from"] == old_fingerprint and
+                     control["config_fingerprint"] == fingerprint, "invalid_work_control")
+        allowed_old = old_fingerprint if upgrade is not None and upgrade["root"] == root else None
         job = control["job"]
         if job is not None and job["root"] != root:
             if state["transaction"] is None and job.get("publication") is None:
@@ -604,13 +675,14 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
             job.setdefault("publication", None)
         job["retry_at"] = None
         graph.expected_root = root
-        pages, seen, cursors = _load_pages(store, job, check)
+        graph.recursive = lib.recursive
+        pages, seen, cursors = _load_pages(store, job, check, lib.recursive)
         _require(job["entrycount"] <= max_items and job["pagecount"] <= max_pages, "item_bound")
         if job["phase"] == "scan":
             while True:
                 check()
                 _require(job["pagecount"] < max_pages, "pagination_bound")
-                page = _page(graph.scan_page(root, job["next_cursor"]), root)
+                page = _page(graph.scan_page(root, job["next_cursor"]), root, lib.recursive)
                 _require(not seen.intersection(page["ids"]), "duplicate_item_during_scan")
                 _require(job["entrycount"] + page["entries"] <= max_items, "item_bound")
                 if page["next"] is not None:
@@ -711,9 +783,10 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
             check()
             published = state["libraries"].get(lib.id, {}).get("items", {})
             published_proof = {item["path"]: item for item in published.values()}
-            archived = _archived_proof(store, control, lib, root, check)
-            rejected = (_previous_invalid(store, control, lib, root, check)
+            rejected = (_previous_invalid(store, control, lib, root, check, allowed_old)
                         if getattr(config, "skip_invalid", False) else {})
+            archived = _archived_proof(store, control, lib, root, check, allowed_old,
+                                       rejected if getattr(config, "skip_invalid", False) else None)
             while position[0] < len(pages):
                 check()
                 if job["intent_ref"] is None:
@@ -766,6 +839,10 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                             position = cursor = next_position
                             continue
                         try:
+                            # The inherited Graph download keeps its byte/version,
+                            # redirect and raster guarantees. BOTH item() reads use
+                            # this validated durable row parent and fresh ancestry.
+                            graph.expected_parent = row.get("parent_id", root["id"])
                             content = graph.download(row, row["ext"])
                         except PublisherError as exc:
                             if (not getattr(config, "skip_invalid", False) or
@@ -817,6 +894,7 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                 commit_publication(store, state, target)  # BatchStore fences gallery's own lease.
         control["completed"]["runs"] += 1
         control["completed"]["images"] = len({item["path"] for value in target.values() for item in value["items"].values()})
+        control["completed"]["root"] = root
         if any("skip" in rec for rec in records):
             control["completed"]["invalid_ref"] = _put(store, job["id"], "snapshot", {
                 "owner": control["owner"], "config_fingerprint": control["config_fingerprint"],

@@ -106,11 +106,11 @@ def test_root_invalid_path_fails_before_io(path):
     graph.session.get.assert_not_called()
 
 
-def test_root_recursion_is_never_enabled():
-    graph = client()
-    with pytest.raises(PublisherError, match="recursive_source_not_supported"):
-        graph.root(Library("spotify", "Musica/Spotify", recursive=True))
-    graph.session.get.assert_not_called()
+def test_root_recursion_is_explicitly_enabled():
+    graph = client([response({"id": ROOT["id"], "folder": {},
+                              "parentReference": {"driveId": ROOT["drive_id"]}})])
+    assert graph.root(Library("spotify", "Musica/Spotify", recursive=True)) == ROOT
+    assert graph.recursive is True
 
 
 def test_scan_page_sanitizes_every_persistible_field_and_counts_all_entries():

@@ -1,39 +1,74 @@
 # Publicador beta reanudable de OneDrive
 
-El modo reanudable de `func-shiftingtiles-beta-onedrive` procesa una biblioteca habilitada, no recursiva. Enumera todos los archivos directos, omite carpetas y archivos sin las extensiones JPG, JPEG, PNG, GIF, WebP o AVIF, y copia originales sin convertir, redimensionar ni modificar metadatos. Se conserva `Files.Read`: OneDrive solo se lee.
+El publicador de `func-shiftingtiles-beta-onedrive` admite hasta veinte bibliotecas configuradas en `ONEDRIVE_LIBRARIES`. Cada una tiene su propio recorrido, progreso, transacción de publicación, manifiesto público y galería. OneDrive solo se lee con `Files.Read`: los originales no se convierten, redimensionan, renombran ni modifican.
 
-## Variables
+## Configuración
 
-`ONEDRIVE_SYNC_ENABLED=false` desactiva ambos timers sin operaciones de Graph o publicación. Los archivos públicos ya publicados permanecen visibles. `ONEDRIVE_SYNC_SCHEDULE=0 0 * * * *` inicia una nueva reconciliación cada hora UTC. `ONEDRIVE_CONTINUATION_SCHEDULE=0 */5 * * * *` avanza trabajos pendientes cada cinco minutos; no inicia otra enumeración cuando no hay trabajo. Los timers usan el scheduler nativo de Azure, sin invocaciones recurrentes de Manus.
+`ONEDRIVE_LIBRARIES` es un JSON, no una variable adicional llamada `on`. La propiedad `enabled` activa o desactiva el trabajo de cada biblioteca. La configuración aprobada de esta beta es:
 
-`ONEDRIVE_BATCH_SIZE=64` controla el máximo de candidatos por lote, entre 1 y 100. `ONEDRIVE_RUN_SECONDS=180` limita el presupuesto objetivo por invocación, entre 60 y 180 segundos, con margen respecto del `functionTimeout` de cuatro minutos. `ONEDRIVE_MAX_ITEMS=100000` cuenta todas las entradas, incluidos archivos omitidos y carpetas. `ONEDRIVE_MAX_PAGES=500` mantiene un límite de paginación. La primera protección ya no es el límite legacy de 10.000 entradas; los límites no se eliminan.
+```json
+[
+  {"id":"spotify","path":"Musica/Spotify","recursive":true,"enabled":true},
+  {"id":"instagram","path":"Instagram","recursive":true,"enabled":true}
+]
+```
 
-`ONEDRIVE_RETAIN_INITIAL=true` captura una sola vez las fotos ya publicadas al inicializar el control reanudable y las conserva en la secuencia final. En esta beta se utiliza para las seis fotos de prueba de la subcarpeta anterior. No hace que se sigan escaneando subcarpetas ni conserva automáticamente todas las nuevas versiones de cada ejecución en la secuencia. El ejemplo local deja esta opción en false para que la retención inicial sea explícita.
+El `id` debe ser único, de 1 a 48 caracteres en minúscula, números, guion o guion bajo, empezando por letra o número. Es la identidad del estado y del prefijo público; no reutilizarlo para una carpeta o cuenta distinta. `path` es relativo a la raíz del OneDrive conectado. `recursive:false` lee únicamente archivos directos; `recursive:true` incluye descendientes de carpetas propias, sin seguir elementos remotos/compartidos ni escapar de esa raíz.
 
-`ONEDRIVE_LIBRARIES` sigue definiendo identificador, ruta, recursive y enabled. Esta entrega solo admite una biblioteca activa y no recursiva. Si se cambia la identidad o configuración de un trabajo, se invalida su progreso de forma segura; no se debe editar su journal a mano ni borrar el estado para forzar un reset.
+Se incluyen JPG, JPEG, PNG, GIF, WebP y AVIF con MIME y firma raster válidos. Los archivos sin extensión no se descargan. Si el usuario los renombra fuera del publicador con una extensión compatible, podrán incorporarse en una reconciliación posterior. No se deduce ni corrige su extensión automáticamente. Una foto presente en dos bibliotecas autorizadas tiene una copia por biblioteca; no se deduplican ni mezclan bibliotecas por contenido.
 
-`ONEDRIVE_PROGRESSIVE_PUBLISH=true` publica las copias verificadas al completar cada lote o guardar un prefijo parcial al finalizar una ejecución. `ONEDRIVE_SKIP_INVALID=true` permite registrar y omitir firmas raster incorrectas y contar los archivos mayores de 50 MiB, sin convertir ni renombrar los originales. Ambos valores son false por defecto, para mantener el modo anterior explícitamente disponible. Los errores de autenticación, red, concurrencia, versión o pertenencia a la carpeta no se omiten como si fueran archivos inválidos.
+`ONEDRIVE_SYNC_ENABLED=false` detiene ambos timers antes de Graph, coordinación o publicación. Las fotos públicas existentes permanecen. `enabled:false` detiene el trabajo de esa biblioteca, pero no borra sus fotos, manifiesto ni checkpoints. Desactivar o quitar una entrada no revoca el acceso público a copias ya publicadas.
 
-## Durabilidad y publicación
+`ONEDRIVE_SYNC_SCHEDULE=0 0 * * * *` marca reconciliaciones cada hora UTC. `ONEDRIVE_CONTINUATION_SCHEDULE=0 */5 * * * *` continúa trabajo pendiente cada cinco minutos y no inicia scans de bibliotecas inactivas sin una reconciliación pendiente. Una invocación procesa una biblioteca lista, rotando de manera justa. Una biblioteca nueva se atiende antes de volver a dedicar el turno a una carga larga existente. El timer horario no reinicia una carga que aún está en curso. Los timers son nativos de Azure; no hay ejecuciones recurrentes de Manus.
 
-`publisher-state.json` sigue siendo privado, contiene la conexión delegada y los datos de la galería activa. Su lease serializa los dos timers. `publisher-work.json` contiene progreso pequeño, y `jobs/` contiene chunks privados de páginas, intenciones y copias verificadas. Las referencias usan SHA-256, con controles de esquema, rutas, tamaño, duplicados y cursor de la misma carpeta. Los nombres de fuente y las URLs preautenticadas no se incluyen en esos chunks ni en logs.
+`ONEDRIVE_BATCH_SIZE=64` limita candidatos por lote (configuración entre 1 y 100; modo progresivo acotado a 64). `ONEDRIVE_RUN_SECONDS=180` es el presupuesto objetivo por invocación, con reserva para journaling y margen respecto del timeout de cuatro minutos. Los límites `ONEDRIVE_MAX_ITEMS=100000` y `ONEDRIVE_MAX_PAGES=500` se aplican por biblioteca y cuentan entradas omitidas y páginas de descendientes. Se mantienen controles de profundidad, cursor, ciclos, duplicados y pertenencia; no se eliminan los guards para forzar recorridos ilimitados.
 
-La intención de copia se guarda antes de subir; las copias usan rutas opacas, creación sin overwrite y digest SHA-256. Una reanudación conserva lotes terminados y solo reconcilia trabajo ambiguo. Las comprobaciones de existencia de la galería se hacen mediante listados paginados, no un HEAD por cada foto en cada hora. Las lecturas antes/después de descargar comprueban versión y pertenencia a la carpeta.
+`ONEDRIVE_PROGRESSIVE_PUBLISH=true` publica cada lote verificado o prefijo parcial al terminar una ejecución. `ONEDRIVE_SKIP_INVALID=true` registra y omite firmas raster inválidas, y cuenta archivos mayores de 50 MiB como omitidos. No transforma errores de autenticación, red, versión, raíz, ownership o almacenamiento en falsas omisiones de fotos.
 
-Primero se completa el scan durable de metadatos. Con publicación progresiva habilitada, cada lote de copias verificadas amplía `gallery.json`, conservando la galería anterior y las seis fotos iniciales mientras quedan copias pendientes. El checkpoint precede a la intención transaccional; la intención privada precede al manifiesto público, y finalmente se confirma el nuevo estado privado. No se publican archivos incompletos ni registros de omisión. Solo al terminar el trabajo completo se reconcilia la lista final. Con el flag progresivo false, se conserva el comportamiento anterior de publicación únicamente al terminar todas las copias.
+`ONEDRIVE_RETAIN_INITIAL=true` captura una sola vez las imágenes iniciales de cada vista de biblioteca. Los seis originales de prueba ya capturados permanecen únicamente en Spotify. La vista de Instagram nunca recibe ni captura fotos de Spotify. La opción no conserva ilimitadamente todas las versiones nuevas.
 
-La publicación usa también una lease de manifest. Una pausa o pérdida de lease no permite sustituir un manifiesto con un worker obsoleto. La recuperación de una publicación parcial pendiente se realiza antes de continuar copiando. Las actualizaciones repetidas sin cambios no necesitan republicar el manifiesto ni descargar imágenes. El navegador consulta el listado cada minuto y aplica los cambios a la animación existente, sin reinicializarla ni descargar toda la colección en cada consulta.
+## Destinos y galerías independientes
 
-Las consultas del navegador son condicionales mediante ETag/If-None-Match. Azure responde HTTP 304 sin cuerpo cuando el manifiesto no cambió; el controlador conserva fotos y cache en ese caso. Esto evita transferir repetidamente el listado completo en una pestaña abierta después de terminar la carga, aunque cada consulta sigue siendo una operación HTTP.
+Storage account `saauxfotos`, contenedor público `$web`:
 
-No se eliminan automáticamente copias o chunks en esta entrega. Las bajas/versiones no activas pueden quedar en la cola privada `pending_cleanup`; se difieren para no inferir eliminaciones de scans parciales o de una carpeta que cambió entre páginas. No usar `clear-published --confirm` como mantenimiento rutinario: desconecta y vacía deliberadamente la galería activa, y requiere una autorización de eliminación aparte. Si hay trabajo en curso, sus intenciones privadas deben revisarse antes de cualquier mantenimiento manual.
+```text
+photos/onedrive/spotify/<hash>.<ext>
+photos/onedrive/spotify/gallery.json
+photos/onedrive/instagram/<hash>.<ext>
+photos/onedrive/instagram/gallery.json
+```
 
-Los originales siguen intactos. Sus copias públicas conservan EXIF/GPS y otros metadatos si están presentes. Los archivos sin extensiones compatibles no se sincronizan; si el usuario los renombra fuera del publicador, podrán entrar en una reconciliación posterior, siempre que contenido, MIME y firma raster sean válidos.
+Las copias usan rutas opacas, sin los nombres originales de OneDrive. Las subcarpetas afectan al recorrido, pero sus copias siguen dentro del prefijo de su biblioteca, sin reproducir nombres privados de carpetas.
 
-## Operación
+- Spotify predeterminada: https://saauxfotos.z26.web.core.windows.net/
+- Spotify explícita: https://saauxfotos.z26.web.core.windows.net/?library=spotify
+- Instagram: https://saauxfotos.z26.web.core.windows.net/?library=instagram
 
-Desplegar siempre con `ONEDRIVE_SYNC_ENABLED=false` y ambos schedules ya configurados. El paquete debe incluir los doce módulos/archivos de ejecución, sin settings, caches, secretos ni tests, y con permisos Unix ZIP 0644. Verificar que `OneDrivePublisher` y `OneDriveContinuation` están indexadas, que el host está Running y que ambas respetan la desactivación antes de habilitar.
+El alias `$web/gallery.json` conserva **solo Spotify**, por compatibilidad. Nunca contiene una lista combinada. Cada selección tiene un cache separado; las respuestas o caches que incluyan fotos de otra biblioteca se rechazan íntegramente. Bibliotecas nuevas vacías, inexistentes o indisponibles muestran una galería vacía, no el fallback de Spotify. Spotify conserva su fallback legado.
 
-Tras habilitar y permitir que los settings se propaguen a la instancia, una invocación manual de `OneDrivePublisher` inicia la carga. Las continuaciones nativas seguirán desde los checkpoints. Una galería parcial visible no equivale a una carga completa: solo se considera terminada cuando se confirma el resultado final del motor y el manifiesto público. Si fallan repetidamente el arranque o el progreso, volver a false y conservar los estados privados para diagnosticar, sin reset.
+El navegador consulta cada minuto con ETag/If-None-Match; HTTP 304 conserva el último listado válido sin transferir otra vez el manifiesto. Los cambios se aplican a la animación existente, sin duplicar timers ni precargar toda la colección. Una respuesta válida vacía limpia/oculta la selección actual.
 
-El inventario anterior al renombramiento estimó aproximadamente 1,09 GiB; el conjunto elegible puede cambiar tras corregir extensiones. El cómputo, checkpoints, coexistencia de versiones, retención de borrados durante siete días, logs y tráfico público se cobran aparte. La publicación por lotes añade escrituras de estado y manifiesto por lote, no por foto. La referencia de 15 AUD mensuales no es un tope automático. Consultar Cost Management después de la carga considerando el retraso de contabilización. Cambiar la frecuencia reduce escaneos, pero no elimina el coste de servir fotos a visitantes.
+## Estado y recuperación
+
+El contenedor `onedrive-state` es privado. `publisher-state.json` conserva la conexión delegada y todas las galerías confirmadas, con transacciones independientes por biblioteca. Una sola lease primaria serializa escrituras y renovación de credenciales. Las vistas del motor solo ven sus propias fotos, intents y cola de mantenimiento, y sus escrituras se integran sin sustituir datos de otra biblioteca.
+
+- Spotify conserva `publisher-work.json` y las referencias existentes.
+- Otras bibliotecas usan `libraries/<id>/publisher-work.json`.
+- `publisher-coordinator.json` guarda rotación y reconciliaciones pendientes.
+- `jobs/<uuid>/` contiene chunks de scan, intenciones y completions con SHA-256.
+
+El recorrido recursivo se reanuda desde un cursor durable y acotado con IDs de carpetas y cadenas de pertenencia, no nombres ni URLs de descarga. Se valida que cada enlace paginado corresponda al endpoint de hijos de su carpeta. Al descargar se vuelve a comprobar versión, padre y pertenencia a la raíz antes/después; los movimientos fuera del ámbito no autorizan publicación.
+
+La transición aprobada de **no recursivo a recursivo para la misma biblioteca, ruta, cuenta, cliente y almacenamiento** archiva el trabajo anterior y conserva sus pruebas de ownership y SHA, sus copias y la retención inicial. Requiere volver a recorrer metadatos para incluir descendientes, pero no necesita volver a descargar copias previamente verificadas que sigan coincidiendo. No se aplica esa adopción automática a cambios de cuenta, ruta o cliente, ni sobre una publicación ambigua pendiente. No se debe editar el journal o borrar el estado para forzar un reset.
+
+Primero se completa el scan durable de metadatos de cada biblioteca. Después se guardan intenciones de copia antes de subir, y completions verificadas antes de ampliar su manifiesto. El checkpoint precede a la intención transaccional; la intención privada precede al manifiesto público, y el estado se confirma después. La recuperación de una publicación pendiente ocurre antes de nuevas descargas de esa biblioteca. Se preserva la última galería válida mientras quedan candidatos pendientes; solo al finalizar se reconcilia la lista completa.
+
+No se eliminan automáticamente copias ni chunks. Las versiones fuera de la lista activa pueden quedar en `pending_cleanup`. No usar el comando legado `clear-published` como mantenimiento rutinario de galerías multi-biblioteca: la limpieza de todos los manifiestos separados requiere un flujo explícito y una autorización de eliminación independiente.
+
+## Despliegue y costes
+
+Desplegar con `ONEDRIVE_SYNC_ENABLED=false`. El paquete debe incluir los trece archivos de ejecución, incluido `library_sync.py`, sin settings, caches, secretos ni tests, y con permisos Unix ZIP 0644. Verificar el host `Running`, los dos timers indexados y sus guards antes de habilitar. Los settings deben propagarse a la instancia antes de invocar.
+
+Al habilitar, una invocación manual de `OneDrivePublisher` registra las bibliotecas para reconciliación; el coordinador las atiende por turnos y las continuaciones nativas prosiguen desde sus checkpoints. Añadir una biblioteca al JSON no exige cambiar código; su primer scan comienza en la siguiente reconciliación horaria o invocación manual del publisher. Un manifiesto parcial visible no significa que la carga completa haya concluido.
+
+Dos bibliotecas y subcarpetas añaden metadatos, descargas iniciales, almacenamiento y posibles logs/tráfico. No se provisionan recursos nuevos ni se reprocesan fotos mediante conversión. El cómputo, checkpoints, coexistencia de versiones y tráfico público se cobran aparte. 15 AUD mensuales es una referencia, no un tope automático; comprobar Cost Management después considerando el retraso de contabilización. Los originales y sus copias conservan EXIF/GPS si existen, y las copias son públicamente accesibles.
