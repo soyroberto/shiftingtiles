@@ -25,7 +25,7 @@ function fixture(cached, storageThrows = false) {
     onImages: (images, source) => updates.push({images, source})
   });
   return {controller, updates, timers, data,
-    success: value => success(value), failure: () => failure(Error('offline'))};
+    success: (value, notModified) => success(value, notModified), failure: () => failure(Error('offline'))};
 }
 
 test('manifest paths are same-origin opaque raster paths and duplicates are removed', () => {
@@ -50,7 +50,18 @@ test('startup plays bundled fallback immediately, then prefers OneDrive', () => 
   f.success(manifest([photo]));
   assert.deepEqual(f.controller.current(), {images: [photo], source: 'onedrive'});
   assert.equal(f.timers.size, 1);
-  assert.equal([...f.timers.values()][0].ms, 900000);
+  assert.equal([...f.timers.values()][0].ms, 60000);
+});
+
+test('HTTP 304 retains photos and cache without reinitializing playback', () => {
+  const f = fixture(); f.controller.start(); f.success(manifest([photo]));
+  const cache = f.data.cache;
+  f.controller.refresh(); f.success(undefined, true);
+  assert.deepEqual(f.controller.current(), {images: [photo], source: 'onedrive'});
+  assert.equal(f.updates.length, 2);
+  assert.equal(f.data.cache, cache);
+  assert.equal(f.timers.size, 1);
+  assert.equal([...f.timers.values()][0].ms, 60000);
 });
 
 test('temporary request failure retains last good photos; later success updates in place', () => {

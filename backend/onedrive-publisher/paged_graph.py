@@ -149,7 +149,12 @@ class PagedGraph(GraphClient):
                 skip("mime")
                 continue
             size = source.get("size")
-            if type(size) is not int or not 0 <= size <= MAX_BYTES:
+            if type(size) is not int or size < 0:
+                raise PublisherError("file_size_bound")
+            if size > MAX_BYTES:
+                if getattr(self, "skip_invalid", False):
+                    skip("oversize")
+                    continue
                 raise PublisherError("file_size_bound")
             tags = [source.get("cTag"), source.get("eTag")]
             if any(tag is not None and (not isinstance(tag, str) or len(tag) > 4096)

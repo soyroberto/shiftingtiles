@@ -13,6 +13,7 @@ from config import Config, PublisherError
     ('ONEDRIVE_MAX_PAGES', '501'), ('ONEDRIVE_MAX_PAGES', '0'),
     ('ONEDRIVE_RUN_SECONDS', '181'), ('ONEDRIVE_RUN_SECONDS', '59'),
     ('ONEDRIVE_RUN_SECONDS', 'NaN'), ('ONEDRIVE_RETAIN_INITIAL', 'yes'),
+    ('ONEDRIVE_PROGRESSIVE_PUBLISH', 'yes'), ('ONEDRIVE_SKIP_INVALID', 'yes'),
 ])
 def test_limits_fail_closed(monkeypatch, name, raw):
     monkeypatch.setenv(name, raw)
@@ -23,10 +24,13 @@ def test_limits_fail_closed(monkeypatch, name, raw):
 def test_limits_from_environment(monkeypatch):
     monkeypatch.setenv('ONEDRIVE_BATCH_SIZE', '32')
     monkeypatch.setenv('ONEDRIVE_RETAIN_INITIAL', 'true')
+    monkeypatch.setenv('ONEDRIVE_PROGRESSIVE_PUBLISH', 'true')
+    monkeypatch.setenv('ONEDRIVE_SKIP_INVALID', 'true')
     config = Config.from_env()
     assert config.batch_size == 32
     assert config.max_items == 100000 and config.max_pages == 500
     assert config.run_seconds == 180 and config.retain_initial
+    assert config.progressive and config.skip_invalid
 
 
 @pytest.mark.parametrize('method', ['onedrive_publisher', 'onedrive_continuation'])

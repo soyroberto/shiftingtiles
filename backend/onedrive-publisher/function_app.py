@@ -28,10 +28,10 @@ def _run(start_new):
         with store.locked():
             result = run_resumable(store, config, start_new=start_new,
                                    deadline=started + config.run_seconds)
-        logging.info("OneDrive resumable: status=%s phase=%s scanned=%s copied=%s images=%s pending_cleanup=%s elapsed=%.2f",
+        logging.info("OneDrive resumable: status=%s phase=%s scanned=%s copied=%s images=%s omitted=%s pending_cleanup=%s elapsed=%.2f",
                      result.get("status", "unknown"), result.get("phase", "idle"),
                      result.get("scanned", 0), result.get("copied", 0),
-                     result.get("images", 0), result.get("pending_cleanup", 0),
+                     result.get("images", 0), result.get("omitted", 0), result.get("pending_cleanup", 0),
                      time.monotonic() - started)
     except HttpResponseError as error:
         # Two timers may wake together. Only the lease winner works; no token/URL text.

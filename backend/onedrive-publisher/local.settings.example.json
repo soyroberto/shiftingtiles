@@ -11,6 +11,8 @@
     "ONEDRIVE_MAX_PAGES": "500",
     "ONEDRIVE_RUN_SECONDS": "180",
     "ONEDRIVE_RETAIN_INITIAL": "false",
+    "ONEDRIVE_PROGRESSIVE_PUBLISH": "false",
+    "ONEDRIVE_SKIP_INVALID": "false",
     "ONEDRIVE_CLIENT_ID": "",
     "ONEDRIVE_LIBRARIES": "[{\"id\":\"spotify\",\"path\":\"Musica/Spotify\",\"recursive\":false,\"enabled\":true}]"
   }

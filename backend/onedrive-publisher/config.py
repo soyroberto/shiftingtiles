@@ -81,6 +81,8 @@ class Config:
     max_pages: int = 500
     run_seconds: int = 180
     retain_initial: bool = False
+    progressive: bool = False
+    skip_invalid: bool = False
 
     @classmethod
     def from_env(cls):
@@ -95,7 +97,11 @@ class Config:
                    max_pages=bounded_integer("ONEDRIVE_MAX_PAGES", 500, 1, 500),
                    run_seconds=bounded_integer("ONEDRIVE_RUN_SECONDS", 180, 60, 180),
                    retain_initial=boolean(os.getenv("ONEDRIVE_RETAIN_INITIAL", "false"),
-                                          "ONEDRIVE_RETAIN_INITIAL"))
+                                          "ONEDRIVE_RETAIN_INITIAL"),
+                   progressive=boolean(os.getenv("ONEDRIVE_PROGRESSIVE_PUBLISH", "false"),
+                                       "ONEDRIVE_PROGRESSIVE_PUBLISH"),
+                   skip_invalid=boolean(os.getenv("ONEDRIVE_SKIP_INVALID", "false"),
+                                        "ONEDRIVE_SKIP_INVALID"))
 
 
 def encoded_path(path):

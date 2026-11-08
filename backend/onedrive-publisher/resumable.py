@@ -1,7 +1,7 @@
-"""Single-root publisher: complete durable scan, private intents, then publication.
+"""Single-root publisher: complete durable scan, then verified batch publication.
 
 The caller holds BatchStore.locked(). Primary v1 state is saved only by auth and
-legacy publication; there are no automatic deletes. All source names/signed URLs
+legacy publication transactions; there are no automatic deletes. All source names/signed URLs
 are ephemeral. Chunk slots are random create-only addresses, not progress indexes:
 a put-before-checkpoint crash must never alias the next (possibly changed) page.
 """
@@ -15,7 +15,7 @@ import time
 import uuid
 
 from auth import silent_token
-from config import MANAGED_PATH, TYPES, PublisherError, content_version, photo_path
+from config import MANAGED_PATH, TYPES, PublisherError, content_version, manifest, photo_path
 from graph import MAX_BYTES
 from paged_graph import PagedGraph
 from sync import commit_publication, recover_publication
@@ -27,7 +27,8 @@ _CONTROL = {"version", "config_fingerprint", "owner", "retained", "job", "comple
 _JOB_FIELDS = {"id", "root", "phase", "scan_refs", "next_cursor", "entrycount",
                "pagecount", "candidatecount", "copy_page", "copy_offset", "copy_refs",
                "intent_ref", "retry_at", "skipped"}
-_SKIP = {"remote", "folder", "nonfile", "heic", "heif", "tif", "tiff", "svg", "other", "mime"}
+_SKIP = {"remote", "folder", "nonfile", "heic", "heif", "tif", "tiff", "svg", "other", "mime", "oversize"}
+_COPY_SKIP = {"invalid_raster_signature"}
 _FATAL = {"duplicate_item_during_scan", "pagination_bound", "item_bound", "page_bound",
           "incomplete_page", "unsafe_graph_cursor", "invalid_nextlink", "invalid_graph_item",
           "invalid_graph_root", "invalid_graph_id", "source_not_owned_folder",
@@ -75,7 +76,10 @@ def validate_control(control):
     if control["retained"] is not None:
         _ref(control["retained"], kind="snapshot")
     metrics = control["completed"]
-    _require(isinstance(metrics, dict) and set(metrics) == {"runs", "images", "ownership_refs"})
+    fields = {"runs", "images", "ownership_refs"}
+    _require(isinstance(metrics, dict) and set(metrics) in (fields, fields | {"invalid_ref"}))
+    if metrics.get("invalid_ref") is not None:
+        _ref(metrics["invalid_ref"], kind="snapshot")
     _integer(metrics["runs"], 2 ** 53)
     _integer(metrics["images"], 100006)
     _require(isinstance(metrics["ownership_refs"], list) and len(metrics["ownership_refs"]) <= _MAX_ARCHIVES)
@@ -84,7 +88,7 @@ def validate_control(control):
     job = control["job"]
     if job is None:
         return control
-    _require(isinstance(job, dict) and set(job) == _JOB_FIELDS)
+    _require(isinstance(job, dict) and set(job) in (_JOB_FIELDS, _JOB_FIELDS | {"publication"}))
     _require(isinstance(job["id"], str) and _JOB.fullmatch(job["id"]))
     PagedGraph._checked_root(job["root"])
     _require(job["phase"] in ("scan", "copy", "publish"))
@@ -110,6 +114,17 @@ def validate_control(control):
         _require(not job["copy_refs"] and job["intent_ref"] is None and
                  job["copy_page"] == job["copy_offset"] == 0)
         _require(job["pagecount"] == 0 or job["next_cursor"] is not None)
+    publication = job.get("publication")
+    if publication is not None:
+        _require(isinstance(publication, dict) and set(publication) == {"position", "final", "sha256"})
+        _require(job["phase"] != "scan" and type(publication["final"]) is bool and
+                 isinstance(publication["position"], list) and
+                 len(publication["position"]) == 2 and
+                 publication["position"] == [job["copy_page"], job["copy_offset"]] and
+                 isinstance(publication["sha256"], str) and _HEX.fullmatch(publication["sha256"]))
+        _integer(publication["position"][0], 500)
+        _integer(publication["position"][1])
+        _require(publication["final"] == (job["phase"] == "publish"))
     _skipped(job["skipped"])
     return control
 
@@ -266,7 +281,8 @@ def _record(row, library_id, digest=None):
 def _records(records, library_id):
     _require(isinstance(records, list) and 1 <= len(records) <= 100, "invalid_private_ledger")
     for rec in records:
-        _require(isinstance(rec, dict) and set(rec) == {"id", "version", "path", "bytes", "sha256"},
+        fields = {"id", "version", "path", "bytes", "sha256"}
+        _require(isinstance(rec, dict) and set(rec) in (fields, fields | {"skip"}),
                  "invalid_private_ledger")
         PagedGraph._identifier(rec["id"])
         _require(isinstance(rec["version"], str) and len(rec["version"]) <= 16384 and
@@ -276,10 +292,13 @@ def _records(records, library_id):
         _integer(rec["bytes"], MAX_BYTES, "invalid_private_ledger")
         _require(rec["sha256"] is None or isinstance(rec["sha256"], str) and _HEX.fullmatch(rec["sha256"]),
                  "invalid_private_ledger")
+        if "skip" in rec:
+            _require(isinstance(rec["skip"], str) and rec["skip"] in _COPY_SKIP and
+                     rec["sha256"] is None, "invalid_private_ledger")
     return records
 
 
-def _batch_payload(payload, pages, library_id):
+def _batch_payload(payload, pages, library_id, allow_skips=False):
     _require(isinstance(payload, dict) and set(payload) == {"start", "end", "records"}, "invalid_private_ledger")
     for field in ("start", "end"):
         _require(isinstance(payload[field], list) and len(payload[field]) == 2, "invalid_private_ledger")
@@ -288,14 +307,18 @@ def _batch_payload(payload, pages, library_id):
     rows, end = _slice(pages, payload["start"], len(records))
     _require(end == payload["end"] and len(rows) == len(records), "invalid_private_ledger")
     for row, rec in zip(rows, records):
-        _require(_record(row, library_id, rec["sha256"]) == rec, "invalid_private_ledger")
+        expected = _record(row, library_id, rec["sha256"])
+        if "skip" in rec:
+            _require(allow_skips, "invalid_private_ledger")
+            expected["skip"] = rec["skip"]
+        _require(expected == rec, "invalid_private_ledger")
     return rows
 
 
 def _completions(store, job, pages, lib_id, check):
     position, records = _position(pages, [0, 0]), []
     for payload in _expand(store, job["copy_refs"], "copy", job["id"], check):
-        _batch_payload(payload, pages, lib_id)
+        _batch_payload(payload, pages, lib_id, allow_skips=True)
         _require(payload["start"] == position, "invalid_private_ledger")
         position = payload["end"]
         records.extend(payload["records"])
@@ -366,10 +389,40 @@ def _archived_proof(store, control, lib, root, check):
         for payload in payloads:
             _require(isinstance(payload, dict) and set(payload) == {"start", "end", "records"}, "invalid_private_ledger")
             for rec in _records(payload["records"], lib.id):
+                if "skip" in rec:
+                    continue  # A rejected source is never ownership/upload proof.
                 previous = proof.get(rec["path"])
                 if previous is None or rec["sha256"] is not None:
                     proof[rec["path"]] = rec
     return proof
+
+
+def _previous_invalid(store, control, lib, root, check):
+    """Only the last complete, same-owner/root scan authorizes a cached rejection."""
+    ref = control["completed"].get("invalid_ref")
+    if ref is None:
+        return {}
+    value = store.read_chunk(ref)
+    fields = {"owner", "config_fingerprint", "library_id", "root", "job_id", "copy_refs"}
+    _require(isinstance(value, dict) and set(value) == fields, "invalid_private_ledger")
+    _require(_ref(ref)[0] == value["job_id"], "invalid_private_ledger")
+    PagedGraph._checked_root(value["root"])
+    if (value["owner"] != control["owner"] or value["config_fingerprint"] != control["config_fingerprint"] or
+            value["library_id"] != lib.id or value["root"] != root):
+        return {}
+    _require(isinstance(value["copy_refs"], list) and len(value["copy_refs"]) <= 128, "invalid_private_ledger")
+    rejected = {}
+    count = 0
+    for payload in _expand(store, value["copy_refs"], "copy", value["job_id"], check):
+        _require(isinstance(payload, dict) and set(payload) == {"start", "end", "records"}, "invalid_private_ledger")
+        for rec in _records(payload["records"], lib.id):
+            count += 1
+            _require(count <= 100000, "invalid_private_ledger")
+            if "skip" in rec:
+                key = (rec["id"], rec["version"])
+                _require(key not in rejected, "invalid_private_ledger")
+                rejected[key] = rec
+    return rejected
 
 
 def _retained(store, control):
@@ -391,10 +444,19 @@ def _retained(store, control):
     return value["libraries"]
 
 
-def _target(state, retained, lib, job, records):
+def _target(state, retained, lib, job, records, partial=False):
     target = copy.deepcopy(state["libraries"])
-    items = {rec["id"]: {"path": rec["path"], "version": rec["version"]} for rec in records}
-    target[lib.id] = {"items": items, "source_path": lib.path, "recursive": False, "skipped": job["skipped"]}
+    items = copy.deepcopy(target.get(lib.id, {}).get("items", {})) if partial else {}
+    skipped = dict(job["skipped"])
+    for rec in records:
+        if "skip" in rec:
+            skipped[rec["skip"]] = skipped.get(rec["skip"], 0) + 1
+            continue
+        previous = items.get(rec["id"])
+        if previous and previous["path"] != rec["path"]:
+            items["previous:" + hashlib.sha256(previous["path"].encode()).hexdigest()] = previous
+        items[rec["id"]] = {"path": rec["path"], "version": rec["version"]}
+    target[lib.id] = {"items": items, "source_path": lib.path, "recursive": False, "skipped": skipped}
     for ident, original in retained.items():
         dest = target.setdefault(ident, {"items": {}})["items"]
         paths = {item["path"] for item in dest.values()}
@@ -406,6 +468,25 @@ def _target(state, retained, lib, job, records):
             dest[key] = copy.deepcopy(item)
             paths.add(item["path"])
     return target
+
+
+def _target_digest(target):
+    return hashlib.sha256(json.dumps(target, sort_keys=True, separators=(",", ":"),
+                                    allow_nan=False).encode()).hexdigest()
+
+
+def _items(target):
+    return {key: value["items"] for key, value in target.items()}
+
+
+def _transaction_target(tx, target):
+    _require(isinstance(tx, dict) and set(tx) == {"libraries", "manifest"} and
+             tx["libraries"] == target, "pending_publication")
+    value = tx["manifest"]
+    _require(isinstance(value, dict) and set(value) == {"version", "images", "updatedAt"} and
+             type(value["version"]) is int and value["version"] == 1 and
+             isinstance(value["updatedAt"], str) and
+             value["images"] == manifest(target)["images"], "pending_publication")
 
 
 def run_resumable(store, config, start_new=True, deadline=None, graph_factory=PagedGraph,
@@ -420,7 +501,31 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
     job = None
     lib = None
     checkpoint = None
+    records = []
+    state = None
+    progressive = bool(getattr(config, "progressive", False))
+    publishing = False
+    published_any = False
+    publish_prefix = None
     result = {"status": "failed"}
+
+    def summary(value):
+        if not progressive or job is None:
+            return value
+        reasons = dict(job["skipped"])
+        copied, bytecount = 0, 0
+        for rec in records:
+            if "skip" in rec:
+                reasons[rec["skip"]] = reasons.get(rec["skip"], 0) + 1
+            else:
+                copied += 1
+                bytecount += rec["bytes"]
+        images = len({item["path"] for library in (state or {}).get("libraries", {}).values()
+                      for item in library["items"].values()})
+        return dict(value, phase="complete" if control["job"] is None else job["phase"],
+                    scanned=job["entrycount"], copied=copied, bytes=bytecount,
+                    images=images, omitted=sum(reasons.values()), reasons=reasons)
+
     try:
         started = clock()
         seconds = getattr(config, "run_seconds", 180)
@@ -428,8 +533,10 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
         if not config.enabled:
             return {"status": "disabled"}
         lib, batch_size, max_items, max_pages, seconds = _limits(config)
+        if progressive:
+            batch_size = min(batch_size, 64)
         end = min(started + seconds, deadline if deadline is not None else started + seconds)
-        work_end = end - _CHECKPOINT_RESERVE
+        work_end = end - (20 if progressive else _CHECKPOINT_RESERVE)
 
         def check():
             if clock() >= work_end:
@@ -452,7 +559,9 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
         if control is not None and (control["config_fingerprint"] != fingerprint or control["owner"] != state["owner"]):
             # Keep bootstrap/old-account proof intact; require deliberate private recovery
             # instead of silently resetting its ownership boundary.
-            _archive(store, control, lib.id)
+            if not (state["transaction"] is not None or
+                    (control["job"] and control["job"].get("publication") is not None)):
+                _archive(store, control, lib.id)
             return {"status": "aborted", "reason": "ownership_or_config_changed"}
         if control is None:
             control = {"version": 1, "config_fingerprint": fingerprint, "owner": state["owner"],
@@ -466,19 +575,22 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                                            {"owner": state["owner"], "libraries": originals})
             _save(store, control)  # Bootstrap is captured once, never from later scans.
         retained = _retained(store, control)
-        _require(all(item["path"] in set(state["managed"]) for value in retained.values()
+        managed_paths = set(state["managed"])
+        _require(all(item["path"] in managed_paths for value in retained.values()
                      for item in value["items"].values()), "invalid_private_ledger")
         check()
         token = silent_token(store, state, config.client_id)
         check()
         graph = graph_factory(token, deadline=work_end)
+        graph.skip_invalid = bool(getattr(config, "skip_invalid", False))
         root = graph.root(lib)
         PagedGraph._checked_root(root)
         check()
         job = control["job"]
         if job is not None and job["root"] != root:
-            _archive(store, control, lib.id)
-            return {"status": "aborted", "reason": "source_root_changed"}
+            if state["transaction"] is None and job.get("publication") is None:
+                _archive(store, control, lib.id)
+            return summary({"status": "aborted", "reason": "source_root_changed"})
         if job is None:
             _require(state["transaction"] is None, "pending_publication")
             job = {"id": uuid.uuid4().hex, "root": root, "phase": "scan", "scan_refs": [],
@@ -487,6 +599,9 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                    "retry_at": None, "skipped": {}}
             control["job"] = job
             _save(store, control)
+        # Optional marker: old controls remain valid, flags never alter ownership.
+        if progressive:
+            job.setdefault("publication", None)
         job["retry_at"] = None
         graph.expected_root = root
         pages, seen, cursors = _load_pages(store, job, check)
@@ -519,8 +634,58 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                     break
         records = _completions(store, job, pages, lib.id, check)
         position = [job["copy_page"], job["copy_offset"]]
+        _require(position == _position(pages, position), "invalid_private_ledger")
         pending = []
         pending_start = position[:]
+
+        def publish_completed(final=False):
+            nonlocal publishing, published_any
+            marker = job.get("publication")
+            if marker is None and not final and not any("skip" not in rec for rec in records):
+                _require(state["transaction"] is None, "pending_publication")
+                return  # All-invalid prefixes never create an empty first manifest.
+            if marker is not None:
+                _require(marker["position"] == position and
+                         marker["final"] == (position == [len(pages), 0]), "invalid_private_ledger")
+                final = marker["final"]
+            target = _target(state, retained, lib, job, records, partial=not final)
+            digest = _target_digest(target)
+            changed = _items(target) != _items(state["libraries"])
+            if marker is not None:
+                _require(marker["sha256"] == digest, "invalid_private_ledger")
+            else:
+                if state["transaction"] is not None:
+                    # A pre-flag legacy final transaction has no partial marker.
+                    # Only a complete ledger and its exact final target allow it.
+                    _require(final and job["phase"] == "publish" and
+                             position == [len(pages), 0], "pending_publication")
+                    _transaction_target(state["transaction"], target)
+                elif not changed:
+                    return
+                if final:
+                    job["phase"] = "publish"
+                job["publication"] = {"position": position[:], "final": final, "sha256": digest}
+                _save(store, control)  # Exact durable ledger/cursor BEFORE primary transaction.
+            if clock() >= end:
+                raise PublisherError("engine_deadline")
+            publishing = True
+            state["managed"] = sorted(set(state["managed"]) |
+                                      {rec["path"] for rec in records if "skip" not in rec})
+            if state["transaction"] is not None:
+                tx = state["transaction"]
+                _transaction_target(tx, target)
+                recover_publication(store, state)
+                published_any = True
+            elif changed:
+                commit_publication(store, state, target)
+                published_any = True
+            # If the primary commit succeeded but this checkpoint crashed, the
+            # same marker validates the already-committed target without republish.
+            job["publication"] = None
+            _save(store, control)
+            publishing = False
+
+        publish_prefix = publish_completed
 
         def flush():
             nonlocal pending, pending_start
@@ -534,6 +699,12 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
             _save(store, control)
 
         checkpoint = flush
+        # Recover a partial transaction (or a durable unpublished prefix) BEFORE
+        # inventory/downloads. A partial primary tx is never the final snapshot.
+        if job.get("publication") is not None or (progressive and records):
+            publish_completed(final=position == [len(pages), 0])
+        elif progressive and not (job["phase"] == "publish" and position == [len(pages), 0]):
+            _require(state["transaction"] is None, "pending_publication")
         if job["phase"] == "copy" and position[0] < len(pages):
             check()
             inventory = store.public_inventory(lib.id)  # Exactly once per copy invocation; no per-photo HEAD.
@@ -541,6 +712,8 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
             published = state["libraries"].get(lib.id, {}).get("items", {})
             published_proof = {item["path"]: item for item in published.values()}
             archived = _archived_proof(store, control, lib, root, check)
+            rejected = (_previous_invalid(store, control, lib, root, check)
+                        if getattr(config, "skip_invalid", False) else {})
             while position[0] < len(pages):
                 check()
                 if job["intent_ref"] is None:
@@ -567,6 +740,8 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                 _require(intent["start"] <= position < intent["end"], "invalid_private_ledger")
                 cursor = intent["start"][:]
                 for row, intent_rec in zip(rows, intent["records"]):
+                    if progressive and len(pending) >= 64:
+                        break  # A pre-flag legacy intent may contain up to 100 rows.
                     _, next_position = _slice(pages, cursor, 1)
                     if cursor < position:
                         cursor = next_position
@@ -583,7 +758,24 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                     else:
                         # SHA-ambiguous staged intents may re-download ONCE to prove
                         # bytes against stored metadata. Completed prefix never does.
-                        content = graph.download(row, row["ext"])
+                        previous_invalid = rejected.get((rec["id"], rec["version"]))
+                        if info is None and previous_invalid is not None:
+                            expected = dict(rec, sha256=None, skip=previous_invalid["skip"])
+                            _require(previous_invalid == expected, "download_item_changed")
+                            pending.append(expected)
+                            position = cursor = next_position
+                            continue
+                        try:
+                            content = graph.download(row, row["ext"])
+                        except PublisherError as exc:
+                            if (not getattr(config, "skip_invalid", False) or
+                                    str(exc) not in _COPY_SKIP or info is not None):
+                                raise
+                            rec["sha256"] = None
+                            rec["skip"] = str(exc)
+                            pending.append(rec)
+                            position = cursor = next_position
+                            continue
                         _require(isinstance(content, bytes) and len(content) == rec["bytes"], "download_item_changed")
                         rec["sha256"] = hashlib.sha256(content).hexdigest()
                         check()
@@ -595,8 +787,11 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                     pending.append(rec)
                     position = next_position
                     cursor = next_position
-                job["intent_ref"] = None
+                if position == intent["end"]:
+                    job["intent_ref"] = None
                 flush()  # One completion chunk/checkpoint per batch (or partial budget).
+                if progressive:
+                    publish_completed(final=position == [len(pages), 0])
         check()
         _require(position == [len(pages), 0] and len(records) == job["candidatecount"], "invalid_private_ledger")
         if job["phase"] != "publish":
@@ -605,10 +800,13 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
         checkpoint = None
         target = _target(state, retained, lib, job, records)
         managed = set(state["managed"])
-        managed.update(rec["path"] for rec in records)
+        managed.update(rec["path"] for rec in records if "skip" not in rec)
         state["managed"] = sorted(managed)
         check()
-        if state["transaction"] is not None:
+        if progressive:
+            publish_completed(final=True)
+            changed = published_any
+        elif state["transaction"] is not None:
             _require(state["transaction"]["libraries"] == target, "pending_publication")
             recover_publication(store, state)
             changed = True
@@ -619,17 +817,26 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                 commit_publication(store, state, target)  # BatchStore fences gallery's own lease.
         control["completed"]["runs"] += 1
         control["completed"]["images"] = len({item["path"] for value in target.values() for item in value["items"].values()})
+        if any("skip" in rec for rec in records):
+            control["completed"]["invalid_ref"] = _put(store, job["id"], "snapshot", {
+                "owner": control["owner"], "config_fingerprint": control["config_fingerprint"],
+                "library_id": lib.id, "root": root, "job_id": job["id"], "copy_refs": job["copy_refs"]})
+        elif "invalid_ref" in control["completed"]:
+            control["completed"]["invalid_ref"] = None
         control["job"] = None
         _save(store, control)
-        return {"status": "ok" if changed else "unchanged", "images": control["completed"]["images"],
-                "entries": job["entrycount"], "pages": job["pagecount"],
-                "pending_cleanup": len(state["pending_cleanup"])}
+        return summary({"status": "ok" if changed else "unchanged", "images": control["completed"]["images"],
+                        "entries": job["entrycount"], "pages": job["pagecount"],
+                        "pending_cleanup": len(state["pending_cleanup"])})
     except Exception as exc:
         code = str(exc) if isinstance(exc, PublisherError) else "operation_failed"
         if control is not None and job is not None and control.get("job") is job:
             try:
                 if checkpoint is not None:
                     checkpoint()  # Durable completed prefix even when budget/error interrupted a batch.
+                if (progressive and code in _DEFER and not publishing and
+                        publish_prefix is not None and clock() < end):
+                    publish_prefix(final=[job["copy_page"], job["copy_offset"]] == [len(pages), 0])
                 retry = getattr(graph, "retry_not_before", None)
                 if type(retry) in (int, float) and math.isfinite(retry) and retry > now():
                     job["retry_at"] = retry
@@ -647,7 +854,7 @@ def run_resumable(store, config, start_new=True, deadline=None, graph_factory=Pa
                 result = {"status": "failed"}  # Never leak exception strings/responses/URLs.
         elif code in _DEFER:
             result = {"status": "deferred"}
-        return result
+        return summary(result)
     finally:
         if graph is not None:
             try:

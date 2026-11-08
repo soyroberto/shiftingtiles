@@ -37,7 +37,7 @@
     if (!fallback.length) throw new Error("Bundled fallback photos are required");
     var schedule = options.schedule || function (callback, delay) { return setTimeout(callback, delay); };
     var cancel = options.cancel || function (timer) { clearTimeout(timer); };
-    var refreshMs = options.refreshMs || 900000;
+    var refreshMs = options.refreshMs || 60000;
     var storage = options.storage;
     var cacheKey = options.cacheKey || "shiftingtiles-public-gallery-v1";
     var running = false, inFlight = false, timer = null, signature = null;
@@ -82,9 +82,10 @@
         finish();
       }
       try {
-        options.request(function (manifest) {
+        options.request(function (manifest, notModified) {
           if (!inFlight) return;
           if (!running) { finish(); return; }
+          if (notModified === true) { finish(); return; }
           var images;
           try { images = manifestImages(manifest); }
           catch (error) { failure(error); return; }
@@ -123,14 +124,17 @@
       fallback: fallback,
       storage: storage,
       cacheKey: "shiftingtiles-public-gallery-v1:" + (config.manifestUrl || "gallery.json"),
-      refreshMs: config.refreshMs || 900000,
+      refreshMs: config.refreshMs || 60000,
       request: function (success, failure) {
         $.ajax({
           url: config.manifestUrl || "gallery.json",
           dataType: "json",
           cache: false,
+          ifModified: true,
           timeout: config.requestTimeoutMs || 10000
-        }).done(success).fail(function () { failure(new Error("Photo manifest is unavailable")); });
+        }).done(function (manifest, textStatus) {
+          success(manifest, textStatus === "notmodified");
+        }).fail(function () { failure(new Error("Photo manifest is unavailable")); });
       },
       onImages: function (images, source) {
         $gallery.attr("data-photo-source", source);
