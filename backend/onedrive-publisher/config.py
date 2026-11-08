@@ -33,6 +33,16 @@ def boolean(value, name):
     raise PublisherError("invalid_" + name)
 
 
+def bounded_integer(name, default, minimum, maximum):
+    raw = os.getenv(name, str(default))
+    if not re.fullmatch(r"[0-9]{1,6}", raw):
+        raise PublisherError("invalid_" + name)
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise PublisherError("invalid_" + name)
+    return value
+
+
 def libraries(raw):
     try:
         data = json.loads(raw)
@@ -66,6 +76,11 @@ class Config:
     client_id: str
     account_url: str = "https://saauxfotos.blob.core.windows.net"
     state_container: str = "onedrive-state"
+    batch_size: int = 64
+    max_items: int = 100000
+    max_pages: int = 500
+    run_seconds: int = 180
+    retain_initial: bool = False
 
     @classmethod
     def from_env(cls):
@@ -74,7 +89,13 @@ class Config:
             raise PublisherError("invalid_ONEDRIVE_CLIENT_ID")
         # Deliberately fixed storage boundaries for this single-site beta.
         return cls(boolean(os.getenv("ONEDRIVE_SYNC_ENABLED", "false"), "ONEDRIVE_SYNC_ENABLED"),
-                   libraries(os.getenv("ONEDRIVE_LIBRARIES", DEFAULT_LIBRARIES)), client)
+                   libraries(os.getenv("ONEDRIVE_LIBRARIES", DEFAULT_LIBRARIES)), client,
+                   batch_size=bounded_integer("ONEDRIVE_BATCH_SIZE", 64, 1, 100),
+                   max_items=bounded_integer("ONEDRIVE_MAX_ITEMS", 100000, 1000, 100000),
+                   max_pages=bounded_integer("ONEDRIVE_MAX_PAGES", 500, 1, 500),
+                   run_seconds=bounded_integer("ONEDRIVE_RUN_SECONDS", 180, 60, 180),
+                   retain_initial=boolean(os.getenv("ONEDRIVE_RETAIN_INITIAL", "false"),
+                                          "ONEDRIVE_RETAIN_INITIAL"))
 
 
 def encoded_path(path):

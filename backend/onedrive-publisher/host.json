@@ -5,6 +5,7 @@
     "logLevel": {
       "default": "Warning",
       "Function.OneDrivePublisher.User": "Information",
+      "Function.OneDriveContinuation.User": "Information",
       "azure": "Critical",
       "msal": "Critical",
       "urllib3": "Critical"

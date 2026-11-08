@@ -29,7 +29,9 @@ def validate_state(state):
         for field in ("managed", "pending_cleanup"):
             if not isinstance(state[field], list) or any(not MANAGED_PATH.fullmatch(p) for p in state[field]):
                 raise ValueError
-        if not set(state["pending_cleanup"]).issubset(state["managed"]):
+        managed = set(state["managed"])
+        pending_cleanup = set(state["pending_cleanup"])
+        if not pending_cleanup.issubset(managed):
             raise ValueError
         collections = [state["libraries"]]
         if state["transaction"] is not None:
@@ -50,7 +52,7 @@ def validate_state(state):
                 for item in lib["items"].values():
                     if not isinstance(item["version"], str) or not MANAGED_PATH.fullmatch(item["path"]):
                         raise ValueError
-                    if not item["path"].startswith(f"photos/onedrive/{ident}/") or item["path"] not in state["managed"]:
+                    if not item["path"].startswith(f"photos/onedrive/{ident}/") or item["path"] not in managed:
                         raise ValueError
         return state
     except (KeyError, TypeError, ValueError, AttributeError):

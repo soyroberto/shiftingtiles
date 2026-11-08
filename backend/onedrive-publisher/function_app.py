@@ -1,17 +1,24 @@
-"""Azure Functions Python v2 timer. Importing this module performs no remote IO."""
+"""Native Azure timers. Imports never perform remote IO; disable gates both timers."""
 import logging
+import time
+
 import azure.functions as func
+from azure.core.exceptions import HttpResponseError
 from config import Config
-from storage import BlobStore
-from sync import sync_locked
+from batch_storage import BatchStore
+from resumable import run_resumable
 
 app = func.FunctionApp()
+# Preserve the existing test/admin factory seam; runtime uses the extended store.
+BlobStore = BatchStore
 
 
-@app.function_name(name="OneDrivePublisher")
-@app.timer_trigger(schedule="0 */15 * * * *", arg_name="timer", run_on_startup=False, use_monitor=True)
-def onedrive_publisher(timer: func.TimerRequest) -> None:
+def _run(start_new):
+    started = time.monotonic()
     store = None
+    # Dependency diagnostics can contain source names or preauthenticated URLs.
+    for name in ("azure", "msal", "urllib3"):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
     try:
         config = Config.from_env()
         if not config.enabled:
@@ -19,18 +26,36 @@ def onedrive_publisher(timer: func.TimerRequest) -> None:
             return
         store = BlobStore(config)
         with store.locked():
-            result = sync_locked(store, store.load(), config)
-        skipped = {}
-        for counts in result.get("libraries", {}).values():
-            for kind, count in counts["skipped"].items():
-                skipped[kind] = skipped.get(kind, 0) + count
-        images = sum(counts["images"] for counts in result.get("libraries", {}).values())
-        logging.info("OneDrive sync completed: status=%s failed=%s images=%s skipped=%s pending_cleanup=%s",
-                     result["status"], result.get("failed", 0), images, skipped, result.get("pending_cleanup", 0))
+            result = run_resumable(store, config, start_new=start_new,
+                                   deadline=started + config.run_seconds)
+        logging.info("OneDrive resumable: status=%s phase=%s scanned=%s copied=%s images=%s pending_cleanup=%s elapsed=%.2f",
+                     result.get("status", "unknown"), result.get("phase", "idle"),
+                     result.get("scanned", 0), result.get("copied", 0),
+                     result.get("images", 0), result.get("pending_cleanup", 0),
+                     time.monotonic() - started)
+    except HttpResponseError as error:
+        # Two timers may wake together. Only the lease winner works; no token/URL text.
+        if getattr(error, "status_code", None) == 409:
+            logging.info("OneDrive worker already active; this invocation deferred")
+        else:
+            logging.warning("OneDrive storage unavailable; last good gallery and checkpoints retained")
     except Exception:
-        # Azure/requests/MSAL exceptions can contain URLs or sensitive metadata.
-        # Never log exception text, full state, token/cache, or source names.
-        logging.warning("OneDrive sync unavailable; last good gallery retained; check setup and reconnect if needed")
+        # No raw SDK/MSAL/Graph exception text or private state in telemetry.
+        logging.warning("OneDrive sync unavailable; last good gallery and checkpoints retained")
     finally:
         if store is not None:
             store.close()
+
+
+@app.function_name(name="OneDrivePublisher")
+@app.timer_trigger(schedule="%ONEDRIVE_SYNC_SCHEDULE%", arg_name="timer",
+                   run_on_startup=False, use_monitor=True)
+def onedrive_publisher(timer: func.TimerRequest) -> None:
+    _run(start_new=True)
+
+
+@app.function_name(name="OneDriveContinuation")
+@app.timer_trigger(schedule="%ONEDRIVE_CONTINUATION_SCHEDULE%", arg_name="timer",
+                   run_on_startup=False, use_monitor=True)
+def onedrive_continuation(timer: func.TimerRequest) -> None:
+    _run(start_new=False)
