@@ -86,8 +86,25 @@ def test_load_control_is_bounded_and_etag_fenced(azure_store):
     a = azure_store
     configure_read(a.work, b'{"phase":"scan"}')
     assert a.store.load_control() == {"phase": "scan"}
-    a.work.download_blob.assert_called_once_with(length=MAX_CONTROL_BYTES + 1,
+    a.work.download_blob.assert_called_once_with(offset=0, length=MAX_CONTROL_BYTES + 1,
         etag='"version-1"', match_condition=MatchConditions.IfNotModified)
+
+
+def test_bounded_read_passes_real_sdk_argument_validation(monkeypatch):
+    from azure.storage.blob import BlobClient
+    import azure.storage.blob._blob_client as sdk
+    raw = b'{"phase":"scan"}'
+    client = BlobClient('https://offline.blob.core.windows.net', 'private', 'work.json')
+    monkeypatch.setattr(client, 'get_blob_properties', lambda: {'size': len(raw), 'etag': '"version-1"'})
+    downloader = Mock()
+    downloader.readall.return_value = raw
+    factory = Mock(return_value=downloader)
+    # Preserve BlobClient.download_blob's real offset/length validation and option
+    # construction; replace only transport so this regression never uses network.
+    monkeypatch.setattr(sdk, 'StorageStreamDownloader', factory)
+    assert BatchStore._read_bounded(client, MAX_CONTROL_BYTES, 'invalid_work_control') == raw
+    factory.assert_called_once()
+    assert factory.call_args.kwargs['start_range'] == 0
 
 
 @pytest.mark.parametrize("raw", [b"[]", b"null", b'"scalar"', b'{"a":1,"a":2}',
@@ -253,7 +270,7 @@ def test_read_chunk_verifies_hash_and_json_shape(azure_store, raw, value):
     blob = azure_store.private.get_blob_client(ref["name"])
     configure_read(blob, raw)
     assert azure_store.store.read_chunk(ref) == value
-    blob.download_blob.assert_called_once_with(length=MAX_CHUNK_BYTES + 1,
+    blob.download_blob.assert_called_once_with(offset=0, length=MAX_CHUNK_BYTES + 1,
         etag='"version-1"', match_condition=MatchConditions.IfNotModified)
 
 

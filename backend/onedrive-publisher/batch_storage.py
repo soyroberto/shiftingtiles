@@ -76,7 +76,7 @@ class BatchStore(BlobStore):
         if type(size) is not int or size < 0 or size > limit or not isinstance(etag, str) or not etag:
             raise PublisherError(code)
         # HEAD plus an ETag-fenced range prevents an unbounded read after a race.
-        raw = blob.download_blob(length=limit + 1, etag=etag,
+        raw = blob.download_blob(offset=0, length=limit + 1, etag=etag,
                                  match_condition=MatchConditions.IfNotModified).readall()
         if not isinstance(raw, bytes) or len(raw) > limit or len(raw) != size:
             raise PublisherError(code)
