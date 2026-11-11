@@ -44,23 +44,62 @@
 }
 
 /* Implementation */
-body {
+html, body {
+	width: 100%;
+	height: 100%;
 	margin: 0;
 	padding: 0;
+	overflow: hidden;
 	background: black;
 }
 
 @disappear-duration: 1s;
 
 .shiftingtiles {
-	height: 900px;
-	width: 1440px;
+	position: relative;
+	width: 100%;
+	height: 100vh;
+	height: 100dvh;
 	overflow: hidden;
 
 	.image() {
-		background-size: cover;
+		position: relative;
+		isolation: isolate;
+		overflow: hidden;
+		background-color: #242424;
+		/* Both layers inherit the single image set by the existing loader. */
+		background-size: 0 0;
 		background-position: center;
-		/* background-image: to be filled in ;*/
+		background-repeat: no-repeat;
+
+		&::before, &::after {
+			content: "";
+			position: absolute;
+			top: 0;
+			right: 0;
+			bottom: 0;
+			left: 0;
+			background-image: inherit;
+			background-position: center;
+			background-repeat: no-repeat;
+			pointer-events: none;
+		}
+		&::before {
+			/* Overscan keeps transparent blur edges outside the visible tile. */
+			top: -48px;
+			right: -48px;
+			bottom: -48px;
+			left: -48px;
+			z-index: 0;
+			background-size: cover;
+			-webkit-filter: blur(16px);
+			filter: blur(16px);
+		}
+		&::after {
+			z-index: 1;
+			/* Show every edge of the principal photo without changing its ratio. */
+			background-size: contain;
+		}
 	}
 
 	& > .loading {
