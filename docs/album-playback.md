@@ -1,0 +1,13 @@
+# Reproducción de álbumes en beta
+
+La galería usa el manifiesto completo de la biblioteca seleccionada por URL: `?library=instagram`, `?library=spotify` o `?library=bing`. No mezcla bibliotecas ni requiere modificar las variables de la Azure Function para cambiar la reproducción del navegador.
+
+En reposo siempre hay ocho fotos, cuatro por fila. El álbum necesita al menos ocho URLs distintas: con ocho exactas las mantiene fijas; con menos de ocho espera en vez de duplicar imágenes. Cada transición Single/Duo conserva las curvas anteriores y el intervalo nominal de cinco segundos. Las imágenes siguientes se cargan antes de insertar el clon; una carga lenta puede retrasar el cambio, sin sustituir el bloque anterior por una foto duplicada o en blanco. Solo se cargan ocho imágenes iniciales y una o dos para el próximo bloque, nunca todas las del álbum de una vez.
+
+La cola recorre una mezcla aleatoria sin reutilizar URLs hasta completar la vuelta; al empezar otra excluye las fotos aún visibles y las reservadas. Los fallos se distinguen de las fotos vistas y se reintentan de forma acotada dentro de la misma biblioteca. Los archivos no disponibles pueden omitirse durante una vuelta. La exclusión se basa en URLs: dos archivos distintos con contenido idéntico no se comparan visualmente ni se deduplican por contenido.
+
+El manifiesto se consulta cada minuto usando ETag/304. Un cambio conserva el historial de las URLs que siguen presentes y agrega las nuevas; no reinicia constantemente la reproducción. El historial vive en memoria durante esa sesión de página. Recargar manualmente la página inicia otra mezcla. El cache de manifiestos sigue separado por biblioteca.
+
+La distribución se calcula con las proporciones de las ocho fotos cargadas al inicio y al redimensionar el viewport. Durante los reemplazos no cambia globalmente el tipo de bloques ni traslada las fotos existentes entre filas. Mantiene al menos un Single disponible para terminar vueltas impares y situaciones de una sola foto pendiente. Se conserva `contain` para ver las fotos completas, los bordes de 5px y el separador Duo de 10px. Nuevas proporciones pueden dejar más relleno: es el compromiso de conservar fotos completas y evitar reordenamientos bruscos.
+
+`?debug=1` agrega un registro JSON no visible en `#gallery-status` con estado de la cola y del layout, sin panel de comparación ni nuevas solicitudes de imágenes. Los módulos públicos son `album-queue.js`, `gallery-layout.js` y `gallery-player.js`, incluidos en el empaquetado estático. El backend, sus horarios y `ONEDRIVE_LIBRARIES` no cambian con esta actualización.

@@ -160,6 +160,10 @@ html, body {
 			.dual { .transform-origin(100% 50%); }
 		}
 	}
+	&.gallery-balanced > .row {
+		.single { width: var(--st-box-width, 20%); }
+		.dual { width: var(--st-box-width, 10%); }
+	}
 }
 
 .single.disappear {
@@ -212,8 +216,8 @@ html, body {
 }
 
 .disappear-frames(@origwidth) {
-	0%   { .transform(scale3d(1,1,1)); width: @origwidth; }
-	10%  { width: @origwidth; }
+	0%   { .transform(scale3d(1,1,1)); width: var(--st-start-width, @origwidth); }
+	10%  { width: var(--st-start-width, @origwidth); }
 	40%  { .transform(scale3d(.01,.01,1)); }
 	60%  { .transform(scale3d(0,0,1)); width: 0%; }
 	100% { .transform(scale3d(0,0,1)); width: 0%; border-width: 0; }

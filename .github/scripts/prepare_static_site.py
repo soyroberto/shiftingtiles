@@ -19,8 +19,11 @@ REQUIRED_FILES = frozenset(
         "index.html",
         "jquery-1.8.3.js",
         "less-2.5.1.min.js",
+        "album-queue.js",
         "shiftingtiles.js",
         "gallery-source.js",
+        "gallery-layout.js",
+        "gallery-player.js",
         "shiftingtiles.less",
     }
 )

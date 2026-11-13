@@ -24,6 +24,10 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('gallery-source.js', selected)
         with self.assertRaises(ValueError):
             packager.select_files(tracked - {'gallery-source.js'})
+        for module in ('album-queue.js', 'gallery-layout.js', 'gallery-player.js'):
+            self.assertIn(module, selected)
+            with self.assertRaises(ValueError):
+                packager.select_files(tracked - {module})
 
     def test_complete_package_keeps_sources_unchanged(self):
         with tempfile.TemporaryDirectory() as parent:

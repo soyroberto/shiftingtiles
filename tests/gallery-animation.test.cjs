@@ -2,14 +2,23 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-// Set NODE_PATH to the local test-tool installation, or install jsdom in your test environment.
+// Set NODE_PATH to the local test-tool installation; these tests never install dependencies.
 const {JSDOM} = require('jsdom');
 const ROOT = path.resolve(__dirname, '..');
 const photo = 'photos/onedrive/spotify/' + 'a'.repeat(64) + '.jpg';
+const bundled = Array.from({length: 10}, (_, i) => 'f' + (i + 1) + '.jpeg');
+
+function manifestPhotos(library, count = 10) {
+  return Array.from({length: count}, (_, i) => 'photos/onedrive/' + library + '/' +
+    i.toString(16).padStart(64, '0') + '.png');
+}
+const spotifyPhotos = [photo].concat(manifestPhotos('spotify', 9));
+const instagramPhotos = manifestPhotos('instagram');
 
 function fixture(search = '') {
   const dom = new JSDOM('<!doctype html><body><div class="gallery"></div></body>', {
-    url: 'https://saauxfotos.z26.web.core.windows.net/' + search, runScripts: 'outside-only'
+    url: 'https://saauxfotos.z26.web.core.windows.net/' + search,
+    runScripts: 'outside-only', pretendToBeVisual: true
   });
   const w = dom.window;
   w.eval(fs.readFileSync(path.join(ROOT, 'jquery-1.8.3.js'), 'utf8'));
@@ -18,10 +27,14 @@ function fixture(search = '') {
   w.clearTimeout = id => timers.delete(id);
   const requests = [];
   w.Image = class {
+    constructor() { this.naturalWidth = 1600; this.naturalHeight = 900; }
     set src(value) { this.url = value; requests.push(this); }
   };
-  w.eval(fs.readFileSync(path.join(ROOT, 'shiftingtiles.js'), 'utf8'));
-  w.eval(fs.readFileSync(path.join(ROOT, 'gallery-source.js'), 'utf8'));
+  w.Math.random = () => 0.999999;
+  for (const file of ['album-queue.js', 'shiftingtiles.js', 'gallery-source.js',
+    'gallery-layout.js', 'gallery-player.js']) {
+    if (fs.existsSync(path.join(ROOT, file))) w.eval(fs.readFileSync(path.join(ROOT, file), 'utf8'));
+  }
   const $ = w.jQuery;
   return {dom, w, $, gallery: $('.gallery'), timers, requests};
 }
@@ -30,30 +43,44 @@ function succeed(requests) {
   for (const request of requests.slice()) if (request.onload) request.onload();
 }
 
-test('animation receives new URLs without creating a second animation timer', () => {
+function animationTimers(f) {
+  return [...f.timers.values()].filter(timer => timer.ms === 5000);
+}
+
+function close(f, controller) {
+  if (controller) controller.stop();
+  const playback = f.gallery.data('shiftingtiles-playback');
+  if (playback) playback.destroy();
+  f.dom.window.close();
+}
+
+test('animation receives added URLs without creating a second animation timer', () => {
   const f = fixture();
-  f.gallery.shiftingtiles(['f1.jpeg'], {fallbackPhotos: ['f2.jpeg']});
+  const initial = bundled.slice(0, 8);
+  f.gallery.shiftingtiles(initial, {fallbackPhotos: ['foreign.jpeg']});
   succeed(f.requests);
   assert.equal(f.gallery.find('.single, .dual > div').length, 8);
-  assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 1);
-  f.gallery.trigger('st-photos-update', [[photo]]);
-  const frame = [...f.timers.values()].find(t => t.ms === 5000);
-  frame.fn();
+  assert.equal(animationTimers(f).length, 1);
+  f.gallery.trigger('st-photos-update', [initial.concat(photo)]);
+  f.gallery.data('shiftingtiles-playback').frame();
   assert.equal(f.requests.at(-1).url, photo);
+  assert.equal(f.gallery.find('.single, .dual > div').length, 8);
   succeed(f.requests);
-  assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 1);
-  f.dom.window.close();
+  assert.equal(animationTimers(f).length, 1);
+  close(f);
 });
 
-test('a failed OneDrive photo loads a bundled fallback instead of breaking the frame', () => {
+test('a failed OneDrive photo retries from the same album instead of a foreign fallback', () => {
   const f = fixture();
-  f.gallery.shiftingtiles([photo], {fallbackPhotos: ['f1.jpeg']});
+  f.gallery.shiftingtiles(spotifyPhotos, {fallbackPhotos: ['foreign.jpeg']});
   const first = f.requests[0]; first.onerror();
-  const fallback = f.requests.at(-1);
-  assert.equal(fallback.url, 'f1.jpeg');
-  fallback.onload();
-  assert.ok(f.gallery.find('.single').first().attr('style').includes('f1.jpeg'));
-  f.dom.window.close();
+  const replacement = f.requests.at(-1);
+  assert.notEqual(replacement.url, first.url);
+  assert.ok(spotifyPhotos.includes(replacement.url));
+  assert.ok(f.requests.every(request => spotifyPhotos.includes(request.url)));
+  replacement.onload();
+  assert.ok(f.gallery.find('.single').first().attr('style').includes(replacement.url));
+  close(f);
 });
 
 test('mount uses the manifest and later refreshes without restarting the plugin', () => {
@@ -62,30 +89,32 @@ test('mount uses the manifest and later refreshes without restarting the plugin'
     ajaxOptions = options;
     return {done(fn) {resolve = fn; return this;}, fail(fn) {reject = fn; return this;}};
   };
-  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg']);
+  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled);
   assert.equal(ajaxOptions.url, 'photos/onedrive/spotify/gallery.json');
   assert.equal(ajaxOptions.ifModified, true);
   assert.equal(ajaxOptions.cache, false);
   assert.equal(ajaxOptions.timeout, 10000);
   assert.equal(f.gallery.attr('data-photo-source'), 'bundled');
-  resolve({version: 1, images: [photo]});
+  resolve({version: 1, images: spotifyPhotos}); succeed(f.requests);
   assert.equal(f.gallery.attr('data-photo-source'), 'onedrive');
+  const playback = f.gallery.data('shiftingtiles-playback');
   controller.refresh(); reject();
   assert.equal(f.gallery.attr('data-photo-source'), 'onedrive');
+  assert.equal(f.gallery.data('shiftingtiles-playback'), playback);
   assert.equal(f.gallery.children('.row').length, 2);
-  assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 1);
-  controller.stop(); f.dom.window.close();
+  assert.equal(animationTimers(f).length, 1);
+  close(f, controller);
 });
 
-test('space and arrow controls preserve the original animation behavior', () => {
+test('space and arrow controls preserve the original animation behavior after initial readiness', () => {
   const f = fixture();
-  f.gallery.shiftingtiles(['f1.jpeg'], {fallbackPhotos: ['f2.jpeg']});
+  f.gallery.shiftingtiles(bundled); succeed(f.requests);
   const before = f.requests.length;
   f.$(f.w.document.body).trigger(f.$.Event('keydown', {keyCode: 32}));
   assert.ok(f.requests.length > before);
   f.$(f.w.document.body).trigger(f.$.Event('keydown', {keyCode: 38}));
   assert.ok(f.gallery.hasClass('leave'));
-  f.dom.window.close();
+  close(f);
 });
 
 function stubManifest(f) {
@@ -97,12 +126,10 @@ function stubManifest(f) {
   return calls;
 }
 
-const instagramPhoto = 'photos/onedrive/instagram/' + 'b'.repeat(64) + '.png';
-
 for (const library of ['instagram', 'new-library']) {
   test(library + ' starts blank without animation and cannot fetch Spotify fallback', () => {
     const f = fixture('?library=' + library), calls = stubManifest(f);
-    const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg'], {manifestUrl: 'gallery.json'});
+    const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled, {manifestUrl: 'gallery.json'});
     assert.equal(calls[0].options.url, 'photos/onedrive/' + library + '/gallery.json');
     assert.equal(calls[0].options.ifModified, true);
     assert.equal(f.gallery.attr('data-photo-library'), library);
@@ -110,29 +137,29 @@ for (const library of ['instagram', 'new-library']) {
     assert.equal(f.gallery.css('visibility'), 'hidden');
     assert.equal(f.gallery.children().length, 0);
     assert.equal(f.requests.length, 0);
-    assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 0);
+    assert.equal(animationTimers(f).length, 0);
     calls[0].reject();
-    controller.refresh(); calls[1].resolve({version: 1, images: [photo]});
+    controller.refresh(); calls[1].resolve({version: 1, images: spotifyPhotos});
     assert.equal(f.requests.length, 0);
     assert.equal(f.gallery.children().length, 0);
     controller.refresh(); calls[2].resolve({version: 1, images: []});
     assert.equal(f.gallery.attr('data-photo-source'), 'empty');
     assert.equal(f.requests.length, 0);
-    assert.equal([...f.timers.values()].filter(t => t.ms === 60000).length, 1);
-    controller.stop(); f.dom.window.close();
+    assert.equal([...f.timers.values()].filter(timer => timer.ms === 60000).length, 1);
+    close(f, controller);
   });
 }
 
-test('Instagram first images initialize once; 304, empty and recovery keep one animation timer', () => {
+test('Instagram first images initialize once; 304, empty and recovery keep at most one animation timer', () => {
   const f = fixture('?library=instagram'), calls = stubManifest(f);
-  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg']);
-  calls[0].resolve({version: 1, images: [instagramPhoto]}); succeed(f.requests);
+  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled);
+  calls[0].resolve({version: 1, images: instagramPhotos}); succeed(f.requests);
   assert.equal(f.gallery.css('visibility'), 'visible');
   assert.equal(f.gallery.children('.row').length, 2);
-  assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 1);
+  assert.equal(animationTimers(f).length, 1);
   controller.refresh(); calls[1].resolve(undefined, 'notmodified');
   assert.equal(f.gallery.attr('data-photo-source'), 'onedrive');
-  assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 1);
+  assert.equal(animationTimers(f).length, 1);
   controller.refresh(); calls[2].resolve({version: 1, images: []});
   assert.equal(f.gallery.attr('data-photo-source'), 'empty');
   assert.equal(f.gallery.css('visibility'), 'hidden');
@@ -140,70 +167,81 @@ test('Instagram first images initialize once; 304, empty and recovery keep one a
     assert.equal(f.$(tile).css('background-image'), 'none');
   }
   const count = f.requests.length;
-  [...f.timers.values()].find(t => t.ms === 5000).fn();
-  assert.equal(f.requests.length, count); // Empty frames never load stale or bundled photos.
-  controller.refresh(); calls[3].resolve({version: 1, images: [instagramPhoto]});
+  assert.equal(f.gallery.data('shiftingtiles-playback').frame(), false);
+  assert.equal(f.requests.length, count);
+  assert.equal(animationTimers(f).length, 0);
+  controller.refresh(); calls[3].resolve({version: 1, images: instagramPhotos}); succeed(f.requests);
   assert.equal(f.gallery.css('visibility'), 'visible');
   assert.equal(f.gallery.children('.row').length, 2);
-  assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 1);
-  [...f.timers.values()].find(t => t.ms === 5000).fn(); succeed(f.requests);
-  assert.equal(f.requests.at(-1).url, instagramPhoto);
-  assert.ok(f.requests.every(request => request.url === instagramPhoto));
-  controller.stop(); f.dom.window.close();
+  assert.equal(animationTimers(f).length, 1);
+  f.gallery.data('shiftingtiles-playback').frame(); succeed(f.requests);
+  assert.ok(f.requests.every(request => instagramPhotos.includes(request.url)));
+  close(f, controller);
 });
 
 test('empty publication invalidates pending photos before late onload or retry callbacks', () => {
   const f = fixture('?library=instagram'), calls = stubManifest(f);
-  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg']);
-  calls[0].resolve({version: 1, images: [instagramPhoto]});
-  const pending = f.requests.slice();
+  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled);
+  calls[0].resolve({version: 1, images: instagramPhotos});
+  const callbacks = f.requests.map(request => ({load: request.onload, fail: request.onerror}));
   controller.refresh(); calls[1].resolve({version: 1, images: []});
-  for (let i = 0; i < pending.length; i++) {
-    if (i % 2) pending[i].onload();
-    else pending[i].onerror();
+  for (let i = 0; i < callbacks.length; i++) {
+    if (i % 2) callbacks[i].load();
+    else callbacks[i].fail();
   }
-  assert.equal(f.requests.length, pending.length);
+  assert.equal(f.requests.length, callbacks.length);
   assert.equal(f.gallery.css('visibility'), 'hidden');
   for (const tile of f.gallery.find('.single, .dual > div').toArray()) {
     assert.equal(f.$(tile).css('background-image'), 'none');
   }
-  assert.ok(f.requests.every(request => request.url === instagramPhoto));
-  controller.stop(); f.dom.window.close();
+  assert.ok(f.requests.every(request => instagramPhotos.includes(request.url)));
+  close(f, controller);
 });
 
-test('Instagram image failures never use Spotify bundled retry photos', () => {
+test('Instagram image failures retry only URLs from the selected album', () => {
   const f = fixture('?library=instagram'), calls = stubManifest(f);
-  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg']);
-  calls[0].resolve({version: 1, images: [instagramPhoto]});
-  for (const request of f.requests.slice()) request.onerror();
+  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled);
+  const source = manifestPhotos('instagram', 12);
+  calls[0].resolve({version: 1, images: source});
+  for (const request of f.requests.slice()) if (request.onerror) request.onerror();
   assert.ok(f.requests.length >= 8);
-  assert.ok(f.requests.every(request => request.url === instagramPhoto));
-  controller.stop(); f.dom.window.close();
+  assert.ok(f.requests.every(request => source.includes(request.url)));
+  close(f, controller);
+});
+
+test('valid albums with fewer than eight photos wait instead of repeating to fill the gallery', () => {
+  const f = fixture('?library=instagram'), calls = stubManifest(f);
+  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled);
+  calls[0].resolve({version: 1, images: manifestPhotos('instagram', 7)});
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.gallery.children('.row').length, 0);
+  assert.equal(animationTimers(f).length, 0);
+  close(f, controller);
 });
 
 test('invalid explicit selection mounts a blank gallery without Ajax or timers', () => {
   for (const search of ['?library=', '?library=../spotify', '?library=spotify&library=instagram']) {
     const f = fixture(search), calls = stubManifest(f);
-    const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg']);
+    const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled);
     assert.equal(f.gallery.attr('data-photo-source'), 'empty');
     assert.equal(f.gallery.children().length, 0);
     assert.equal(f.requests.length, 0);
     assert.equal(calls.length, 0);
     assert.equal(f.timers.size, 0);
-    controller.stop(); f.dom.window.close();
+    close(f, controller);
   }
 });
 
 test('duplicate mount returns the existing source without duplicating plugin or poll timers', () => {
   const f = fixture('?library=instagram'), calls = stubManifest(f);
-  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg']);
-  calls[0].resolve({version: 1, images: [instagramPhoto]}); succeed(f.requests);
-  assert.equal(f.w.ShiftingTilesPhotos.mount(f.gallery, ['f1.jpeg']), controller);
+  const controller = f.w.ShiftingTilesPhotos.mount(f.gallery, bundled);
+  calls[0].resolve({version: 1, images: instagramPhotos}); succeed(f.requests);
+  assert.equal(f.w.ShiftingTilesPhotos.mount(f.gallery, bundled), controller);
   assert.equal(calls.length, 1);
   assert.equal(f.gallery.children('.row').length, 2);
-  assert.equal([...f.timers.values()].filter(t => t.ms === 5000).length, 1);
-  assert.equal([...f.timers.values()].filter(t => t.ms === 60000).length, 1);
-  controller.stop(); f.dom.window.close();
+  assert.equal(animationTimers(f).length, 1);
+  assert.equal([...f.timers.values()].filter(timer => timer.ms === 60000).length, 1);
+  close(f, controller);
 });
 
 test('inline page initializer honors the URL selection instead of the legacy manifest alias', () => {
@@ -213,5 +251,5 @@ test('inline page initializer honors the URL selection instead of the legacy man
   assert.equal(calls[0].options.url, 'photos/onedrive/instagram/gallery.json');
   assert.equal(f.gallery.attr('data-photo-source'), 'empty');
   assert.equal(f.requests.length, 0);
-  f.gallery.data('shiftingtiles-source').stop(); f.dom.window.close();
+  close(f, f.gallery.data('shiftingtiles-source'));
 });

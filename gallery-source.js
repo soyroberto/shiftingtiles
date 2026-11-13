@@ -182,18 +182,19 @@
       onImages: function (images, source) {
         $gallery.attr("data-photo-source", source);
         $gallery.attr("data-photo-library", library === null ? "" : library);
-        $gallery.css("visibility", images.length ? "" : "hidden");
-        if (!images.length) {
+        $gallery.css("visibility", images.length >= 8 ? "" : "hidden");
+        if (images.length < 8) {
+          $gallery.attr("data-photo-status", images.length ? "waiting-for-eight" : "empty");
           if (initialized) {
-            // The legacy plugin ignores []; a null source makes its next frame inert.
-            // Invalidate pending image callbacks and erase previously visible photos.
-            $gallery.trigger("st-photos-update", [[null]]);
+            // Eight distinct photos are required; never fill gaps with duplicates.
+            $gallery.trigger("st-photos-update", [[]]);
             $gallery.find(".single, .dual > div").each(function () {
-              $(this).data("st-image-request", {}).css("background-image", "none");
+              $(this).data("st-image-request", {}).removeData("st-photo-url").css("background-image", "none");
             });
           }
           return; // Never create animation timers before the first real image.
         }
+        $gallery.attr("data-photo-status", "ready");
         if (!initialized) {
           initialized = true;
           $gallery.shiftingtiles(images.slice(), { fallbackPhotos: fallback.slice() });
